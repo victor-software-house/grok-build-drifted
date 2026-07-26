@@ -333,7 +333,11 @@ pub fn spawn_writer_thread() -> (
                     write_payload(&mut writer, &payload, &thread_sync)
                 };
                 if let Err(error) = result {
+<<<<<<< HEAD
                     tracing::error!(% error, "terminal output failed");
+=======
+                    tracing::error!(%error, "terminal output failed");
+>>>>>>> 47348d13ec4508dcfe440e34c6d511bb02998fb2
                     return Err(error);
                 }
             }
@@ -532,10 +536,17 @@ mod tests {
         write_payload(&mut sink, &payload, &sync).expect("write payload");
         assert_eq!(sink, b"frame bytes");
         assert_eq!(sync.written(), sequence);
+<<<<<<< HEAD
         assert!(
             matches!(events.try_recv(), Ok(WriterEvent::Written(written)) if written ==
             sequence)
         );
+=======
+        assert!(matches!(
+            events.try_recv(),
+            Ok(WriterEvent::Written(written)) if written == sequence
+        ));
+>>>>>>> 47348d13ec4508dcfe440e34c6d511bb02998fb2
         assert_eq!(
             sync.wait_drained(Duration::from_secs(1)).unwrap(),
             WriterDrain::Drained

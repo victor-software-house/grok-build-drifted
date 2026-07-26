@@ -226,6 +226,23 @@ pub enum SettingValue {
     Int(i64),
 }
 
+/// Why `coding_data_sharing` cannot be changed in the settings modal.
+/// Computed by `AppView::coding_data_sharing_lock`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodingDataSharingLock {
+    Zdr,
+    TeamManaged,
+}
+
+impl CodingDataSharingLock {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Zdr => "Your team has Zero Data Retention.",
+            Self::TeamManaged => "Managed by your team admin.",
+        }
+    }
+}
+
 /// Snapshot of pager-local state captured when the modal opens.
 /// Used by `current_value_for` to render against LIVE state rather
 /// than the on-disk `UiConfig`. Refreshed by
@@ -252,6 +269,8 @@ pub struct PagerLocalSnapshot {
     /// `opt_out == false` → canonical "opt-in". Snapshot default is
     /// `true` (opted out) to match the safer consumer default.
     pub coding_data_sharing_opt_out: bool,
+    /// Why `coding_data_sharing` cannot be changed here (`None` = editable).
+    pub coding_data_sharing_lock: Option<CodingDataSharingLock>,
     /// Whether plan mode is active. Uses effective state
     /// (`pending.unwrap_or(active)`) so rapid toggles don't double-send.
     /// Refreshed on all mutation paths including ACP `CurrentModeUpdate`.
@@ -291,6 +310,10 @@ impl Default for PagerLocalSnapshot {
             current_model_name: None,
             available_models: Vec::new(),
             coding_data_sharing_opt_out: true,
+<<<<<<< HEAD
+=======
+            coding_data_sharing_lock: None,
+>>>>>>> 47348d13ec4508dcfe440e34c6d511bb02998fb2
             plan_mode_active: false,
             show_tips: None,
             auto_update: None,
@@ -489,6 +512,13 @@ pub fn current_value_for(
         "page_flip_on_send" => Some(SettingValue::Bool(
             crate::appearance::cache::load_page_flip_on_send(),
         )),
+<<<<<<< HEAD
+=======
+        // Cache is the drain-path source of truth (same pattern as page_flip_on_send).
+        "combine_queued_prompts" => Some(SettingValue::Bool(
+            crate::appearance::cache::load_combine_queued_prompts(),
+        )),
+>>>>>>> 47348d13ec4508dcfe440e34c6d511bb02998fb2
         "simple_mode" => Some(SettingValue::Bool(ui.simple_mode.unwrap_or(true))),
         // Per-tip contextual hints — `None` (inherit) reads as the default ON.
         "contextual_hints.undo" => {
@@ -562,6 +592,10 @@ pub fn current_value_for(
         "screen_mode" => Some(SettingValue::Enum(canonical_screen_mode(
             ui.screen_mode.as_deref(),
         ))),
+        // SHELL — whether the Ctrl+Space / F8 chord is active; None → true.
+        "voice_keybind_enabled" => {
+            Some(SettingValue::Bool(ui.voice_keybind_enabled.unwrap_or(true)))
+        }
         // SHELL — canonicalized from `[ui].voice_capture_mode`; None → "hold".
         "voice_capture_mode" => Some(SettingValue::Enum(canonical_voice_capture_mode(
             ui.voice_capture_mode.as_deref(),
@@ -792,6 +826,16 @@ mod tests {
                         "page_flip_on_send default drifts from UiConfig::default()"
                     );
                 }
+<<<<<<< HEAD
+=======
+                ("combine_queued_prompts", SettingKind::Bool { default }) => {
+                    assert_eq!(
+                        *default,
+                        ui.combine_queued_prompts.unwrap_or(false),
+                        "combine_queued_prompts default drifts from UiConfig::default()"
+                    );
+                }
+>>>>>>> 47348d13ec4508dcfe440e34c6d511bb02998fb2
                 ("simple_mode", SettingKind::Bool { default }) => {
                     assert_eq!(
                         *default,
@@ -967,6 +1011,14 @@ mod tests {
                         "flash"
                     };
                     assert_eq!(*default, expected);
+                }
+                // voice_keybind_enabled: Option<bool>; None → true.
+                ("voice_keybind_enabled", SettingKind::Bool { default }) => {
+                    assert_eq!(
+                        *default,
+                        ui.voice_keybind_enabled.unwrap_or(true),
+                        "voice_keybind_enabled default drifts from UiConfig::default()",
+                    );
                 }
                 // voice_capture_mode: Option<String>; None → "hold".
                 ("voice_capture_mode", SettingKind::Enum { default, .. }) => {
