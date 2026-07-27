@@ -94,7 +94,11 @@ async fn new_session(conn: &acp::ClientSideConnection, cwd: &std::path::Path) ->
         RPC_TIMEOUT,
         conn.new_session(
             acp::NewSessionRequest::new(cwd.to_path_buf())
+<<<<<<< HEAD
                 .meta(json!({ "modelId" : "test-model" }).as_object().cloned()),
+=======
+                .meta(json!({ "modelId": "test-model" }).as_object().cloned()),
+>>>>>>> b41c75a578f98bddbd326ab02cd53618451d97ee
         ),
     )
     .await
@@ -126,7 +130,11 @@ async fn close_session(conn: &acp::ClientSideConnection, session_id: &acp::Sessi
     let resp = ext_method(
         conn,
         "x.ai/session/close",
+<<<<<<< HEAD
         json!({ "sessionId" : session_id.0.as_ref() }),
+=======
+        json!({ "sessionId": session_id.0.as_ref() }),
+>>>>>>> b41c75a578f98bddbd326ab02cd53618451d97ee
     )
     .await;
     assert_eq!(
@@ -183,12 +191,24 @@ async fn connect_and_auth() -> acp::ClientSideConnection {
                         .terminal(false),
                 )
                 .meta(
+<<<<<<< HEAD
                     json!(
                         { "startupHints" : { "nonInteractive" : true,
                         "skipGitStatus" : true, "skipProjectLayout" : true, },
                         "clientType" : "registry-churn-test", "clientVersion" :
                         "0.0-test", }
                     )
+=======
+                    json!({
+                        "startupHints": {
+                            "nonInteractive": true,
+                            "skipGitStatus": true,
+                            "skipProjectLayout": true,
+                        },
+                        "clientType": "registry-churn-test",
+                        "clientVersion": "0.0-test",
+                    })
+>>>>>>> b41c75a578f98bddbd326ab02cd53618451d97ee
                     .as_object()
                     .cloned(),
                 ),
@@ -206,7 +226,11 @@ async fn connect_and_auth() -> acp::ClientSideConnection {
         RPC_TIMEOUT,
         client_conn.authenticate(
             acp::AuthenticateRequest::new(method.id().clone())
+<<<<<<< HEAD
                 .meta(json!({ "headless" : true }).as_object().cloned()),
+=======
+                .meta(json!({ "headless": true }).as_object().cloned()),
+>>>>>>> b41c75a578f98bddbd326ab02cd53618451d97ee
         ),
     )
     .await
