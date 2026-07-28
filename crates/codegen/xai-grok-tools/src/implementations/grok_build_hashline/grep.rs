@@ -147,7 +147,11 @@ Content output format:
 
 Usage:
 - ${{ params.search.pattern }} is a regex: `log.*Error`, `function\s+\w+`, `TODO`
+<<<<<<< HEAD
 - Output modes: "content" (default, with anchors), "files_with_matches", "count"
+=======
+- Default output is anchored content matches (no output-mode selector)
+>>>>>>> 02d9359435d0e9c20a20945679389cdce441e431
 - Use -A, -B, -C for context lines around matches
 - Only use '${{ params.search.type }}' or '${{ params.search.glob }}' when certain of the file type
 - Results are capped; truncated results show "at least" counts"#;
