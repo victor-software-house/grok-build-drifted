@@ -146,6 +146,7 @@ pub enum Outcome {
 pub enum HookOutcome {
     Success,
     Error,
+    Blocked,
 }
 
 /// Outcome of one `PreToolUse` gate callback. Only `Denied` blocks the tool; the rest
@@ -1001,6 +1002,20 @@ pub struct TurnCompleted {
     pub error_category: Option<String>,
 }
 
+/// Model issued a shell tool call whose command is `true` (keepalive thrash signal).
+#[derive(Serialize)]
+pub struct ShellTrueNoop {
+    pub tool_name: String,
+}
+
+/// Harness hard-stopped a turn after identical tool thrash (silent EndTurn).
+#[derive(Serialize)]
+pub struct ActionStationarityStop {
+    pub true_noop: bool,
+    pub run_len: u32,
+    pub tool_name: String,
+}
+
 // ---------------------------------------------------------------------------
 // Tool Calls
 // ---------------------------------------------------------------------------
@@ -1203,6 +1218,15 @@ pub struct TerminalTelemetry {
     pub term_var: String,
     pub tmux_version: String,
     pub xtversion: String,
+    /// Raw, as its source reported it — shapes vary (`"3.5.6"`,
+    /// `"20240203-110809-5046fc22"`, `"7402"`). Empty when unknown.
+    pub term_version: String,
+    pub term_version_source: String,
+    /// The Kitty protocol was negotiated *without* `REPORT_EVENT_TYPES` because
+    /// `term_version` identified a build that mis-encodes key releases
+    /// (Alacritty ≤ 0.14.x). A field rather than its own event so the affected
+    /// population always has a denominator.
+    pub kitty_event_types_withheld: bool,
     pub host_os: String,
     pub display_server: String,
     pub modifier_cmd_fate: String,
@@ -1699,6 +1723,8 @@ telemetry_event!(
     "turn_completed",
     external = crate::external::schema::map_turn_completed
 );
+telemetry_event!(ShellTrueNoop, "shell_true_noop");
+telemetry_event!(ActionStationarityStop, "action_stationarity_stop");
 telemetry_event!(
     ToolCallCompleted,
     "tool_call_completed",
@@ -1830,6 +1856,9 @@ mod tests {
             term_var: "xterm-256color".into(),
             tmux_version: "".into(),
             xtversion: "".into(),
+            term_version: "".into(),
+            term_version_source: "none".into(),
+            kitty_event_types_withheld: false,
             host_os: "linux".into(),
             display_server: "unknown".into(),
             modifier_cmd_fate: "unknown".into(),
