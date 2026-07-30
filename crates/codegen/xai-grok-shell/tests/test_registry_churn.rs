@@ -32,6 +32,11 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(60);
 struct Counts {
     sessions: usize,
     session_threads: usize,
+<<<<<<< HEAD
+=======
+    resident_resources: usize,
+    retained_resources: usize,
+>>>>>>> 500129c714ad1b10e6095481f4a8387a2ec52649
     dispatch_locks: usize,
     session_turn_numbers: usize,
     permission_event_receivers: usize,
@@ -73,11 +78,19 @@ async fn ext_method(
     method: &str,
     params: serde_json::Value,
 ) -> serde_json::Value {
+<<<<<<< HEAD
     let raw =
         serde_json::value::RawValue::from_string(params.to_string()).expect("serialize ext params");
     let resp = tokio::time::timeout(
         RPC_TIMEOUT,
         conn.ext_method(acp::ExtRequest::new(method, Arc::from(raw))),
+=======
+    let params_json =
+        serde_json::value::RawValue::from_string(params.to_string()).expect("serialize ext params");
+    let resp = tokio::time::timeout(
+        RPC_TIMEOUT,
+        conn.ext_method(acp::ExtRequest::new(method, Arc::from(params_json))),
+>>>>>>> 500129c714ad1b10e6095481f4a8387a2ec52649
     )
     .await
     .unwrap_or_else(|_| panic!("{method} timed out"))
@@ -94,7 +107,11 @@ async fn new_session(conn: &acp::ClientSideConnection, cwd: &std::path::Path) ->
         RPC_TIMEOUT,
         conn.new_session(
             acp::NewSessionRequest::new(cwd.to_path_buf())
+<<<<<<< HEAD
                 .meta(json!({ "modelId" : "test-model" }).as_object().cloned()),
+=======
+                .meta(json!({ "modelId": "test-model" }).as_object().cloned()),
+>>>>>>> 500129c714ad1b10e6095481f4a8387a2ec52649
         ),
     )
     .await
@@ -126,7 +143,11 @@ async fn close_session(conn: &acp::ClientSideConnection, session_id: &acp::Sessi
     let resp = ext_method(
         conn,
         "x.ai/session/close",
+<<<<<<< HEAD
         json!({ "sessionId" : session_id.0.as_ref() }),
+=======
+        json!({ "sessionId": session_id.0.as_ref() }),
+>>>>>>> 500129c714ad1b10e6095481f4a8387a2ec52649
     )
     .await;
     assert_eq!(
@@ -183,12 +204,24 @@ async fn connect_and_auth() -> acp::ClientSideConnection {
                         .terminal(false),
                 )
                 .meta(
+<<<<<<< HEAD
                     json!(
                         { "startupHints" : { "nonInteractive" : true,
                         "skipGitStatus" : true, "skipProjectLayout" : true, },
                         "clientType" : "registry-churn-test", "clientVersion" :
                         "0.0-test", }
                     )
+=======
+                    json!({
+                        "startupHints": {
+                            "nonInteractive": true,
+                            "skipGitStatus": true,
+                            "skipProjectLayout": true,
+                        },
+                        "clientType": "registry-churn-test",
+                        "clientVersion": "0.0-test",
+                    })
+>>>>>>> 500129c714ad1b10e6095481f4a8387a2ec52649
                     .as_object()
                     .cloned(),
                 ),
@@ -206,7 +239,11 @@ async fn connect_and_auth() -> acp::ClientSideConnection {
         RPC_TIMEOUT,
         client_conn.authenticate(
             acp::AuthenticateRequest::new(method.id().clone())
+<<<<<<< HEAD
                 .meta(json!({ "headless" : true }).as_object().cloned()),
+=======
+                .meta(json!({ "headless": true }).as_object().cloned()),
+>>>>>>> 500129c714ad1b10e6095481f4a8387a2ec52649
         ),
     )
     .await
@@ -253,6 +290,15 @@ fn session_churn_returns_registry_snapshot_to_baseline() {
             "warmup session must be fully removed before baseline"
         );
         assert_eq!(
+<<<<<<< HEAD
+=======
+            (baseline.resident_resources, baseline.retained_resources),
+            (0, 0),
+            "warmup must leave no per-session resource entries, including \
+             entries holding no resources"
+        );
+        assert_eq!(
+>>>>>>> 500129c714ad1b10e6095481f4a8387a2ec52649
             baseline.workspace_bindings,
             Some(0),
             "warmup must have built the local workspace and released its binding"
