@@ -16,7 +16,11 @@ These knobs are independent of each other (and of this guide's external OTEL str
 | Setting | How to set it |
 |---------|---------------|
 | Telemetry master switch | `[features] telemetry` / `GROK_TELEMETRY_ENABLED` |
+<<<<<<< HEAD
 | `/privacy` | `/privacy opt-in` / `/privacy opt-out`, or Settings |
+=======
+| Coding data, retention, and training | Settings — `/privacy` opens the row |
+>>>>>>> dd04f397b1d02f2272b092555669dfba1f01bc85
 | Trace upload | `[telemetry] trace_upload` / `GROK_TELEMETRY_TRACE_UPLOAD` |
 | External OpenTelemetry | `GROK_EXTERNAL_OTEL` / `[telemetry] otel_*` (this guide) |
 

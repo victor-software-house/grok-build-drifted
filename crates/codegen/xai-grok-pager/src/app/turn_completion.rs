@@ -19,8 +19,14 @@ use super::app_view::AppView;
 /// (right-justified) on the marker line instead of as a standalone block.
 ///
 /// All three marker rails route through here: the driver's `PromptResponse`,
+<<<<<<< HEAD
 /// the lost-RPC reconcile, and the viewer finalize. (Wake turns close
 /// markerless — see `finish_wake_turn` in acp_handler.) `event == None`
+=======
+/// the lost-RPC reconcile, and the viewer finalize. (Wake turns route through
+/// `finish_wake_turn` in acp_handler, which maps their stop reason and calls
+/// here only when a marker is due.) `event == None`
+>>>>>>> dd04f397b1d02f2272b092555669dfba1f01bc85
 /// (bash turns, rate-limit / re-auth UX that replaces the marker) flushes the
 /// held hooks as the legacy standalone lifecycle block so failures stay
 /// visible.

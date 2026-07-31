@@ -271,7 +271,12 @@ During a session, the active method handles all mid-session refreshes.
 
 ## Related settings
 
+<<<<<<< HEAD
 `/privacy` does not change these config knobs:
+=======
+Coding-data sharing — **Coding data, retention, and training** in Settings,
+which `/privacy` opens — does not change these config knobs:
+>>>>>>> dd04f397b1d02f2272b092555669dfba1f01bc85
 
 | Setting | How to set it |
 |---------|---------------|
@@ -279,10 +284,18 @@ During a session, the active method handles all mid-session refreshes.
 | `[telemetry] trace_upload` | `config.toml` or `GROK_TELEMETRY_TRACE_UPLOAD` |
 | External OpenTelemetry | `GROK_EXTERNAL_OTEL` / `[telemetry] otel_*`. See [Monitoring Usage](24-monitoring-usage.md). |
 
+<<<<<<< HEAD
 On team accounts, only a team admin can toggle privacy with `/privacy`.
 Team admins can also enable or disable Zero Data Retention (ZDR) for their team.
 See [How to enable ZDR](https://docs.x.ai/developers/faq/security#how-to-enable-zdr).
 When ZDR is on, `/privacy` cannot change coding-data sharing.
+=======
+On team accounts, only a team admin can change coding-data sharing.
+Team admins can also enable or disable Zero Data Retention (ZDR) for their team.
+See [How to enable ZDR](https://docs.x.ai/developers/faq/security#how-to-enable-zdr).
+When ZDR is on, coding-data sharing cannot be changed at all — the settings
+row shows `ZDR` in place of the value.
+>>>>>>> dd04f397b1d02f2272b092555669dfba1f01bc85
 
 See [Monitoring Usage](24-monitoring-usage.md#related-settings) and [Configuration](05-configuration.md#telemetry).
 
