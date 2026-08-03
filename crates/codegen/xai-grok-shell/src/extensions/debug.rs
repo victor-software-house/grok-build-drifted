@@ -23,13 +23,23 @@ pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
             handle_trigger_feedback(agent, args).await
         }
         "x.ai/debug/arm_auto_compact" => handle_arm_auto_compact(agent, args),
+<<<<<<< HEAD
         "x.ai/debug/agent" => handle_agent(agent),
+=======
+        "x.ai/debug/agent" => handle_agent(agent).await,
+>>>>>>> 780d1388fff103ff0db0d8c14de65af6225b4860
         _ => Err(acp::Error::method_not_found()),
     }
 }
 
+<<<<<<< HEAD
 fn handle_agent(agent: &MvpAgent) -> ExtResult {
     ExtMethodResult::success(serde_json::json!({ "registries": agent.registry_snapshot() }))
+=======
+async fn handle_agent(agent: &MvpAgent) -> ExtResult {
+    let registries = agent.registry_snapshot().await;
+    ExtMethodResult::success(serde_json::json!({ "registries": registries }))
+>>>>>>> 780d1388fff103ff0db0d8c14de65af6225b4860
         .to_ext_response()
         .map_err(|e| acp::Error::internal_error().data(e.to_string()))
 }

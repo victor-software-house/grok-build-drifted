@@ -239,6 +239,7 @@ fn client_identifier_allowlist_is_pinned() {
         "grok-web",
         "grok-desktop",
         "grok-code-extension",
+        "grok-agent-sdk",
         "nebula",
         "zed",
     ];
@@ -919,8 +920,8 @@ fn redacting_log_exporter_drops_record_with_unknown_key() {
 // Remote policy: tighten-only
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[test]
-fn remote_force_disable_stops_emission() {
+#[tokio::test(flavor = "current_thread")]
+async fn remote_force_disable_stops_emission() {
     let stream = build(gates_off());
     super::apply_remote_policy_on(
         &stream.ext,
@@ -935,8 +936,8 @@ fn remote_force_disable_stops_emission() {
     );
 }
 
-#[test]
-fn remote_gate_lock_forces_gates_off_and_never_on() {
+#[tokio::test(flavor = "current_thread")]
+async fn remote_gate_lock_forces_gates_off_and_never_on() {
     let stream = build(gates_all_on());
     super::apply_remote_policy_on(
         &stream.ext,
@@ -956,6 +957,78 @@ fn remote_gate_lock_forces_gates_off_and_never_on() {
             .ext
             .active
             .load(std::sync::atomic::Ordering::Relaxed)
+    );
+}
+
+/// All tests that mutate `SETTINGS_RESOLVED` must hold this lock.
+static GATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn settings_gate_suppresses_until_resolved() {
+    let _serial = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    struct RestoreGate;
+    impl Drop for RestoreGate {
+        fn drop(&mut self) {
+            super::mark_external_otel_settings_resolved();
+        }
+    }
+    let _restore = RestoreGate;
+
+    // Baseline: default open.
+    super::mark_external_otel_settings_resolved();
+    assert!(super::is_settings_gate_open(), "gate defaults open");
+
+    // Leader closes it at the start of its auth/network phase.
+    super::suppress_external_otel_until_settings();
+    assert!(
+        !super::is_settings_gate_open(),
+        "gate must be closed until settings resolve"
+    );
+    assert!(
+        !super::is_active(),
+        "is_active must be false while the settings gate is closed"
+    );
+
+    // Settings response arrives (policy evaluated) → reopen.
+    super::mark_external_otel_settings_resolved();
+    assert!(
+        super::is_settings_gate_open(),
+        "gate must reopen after settings are resolved"
+    );
+}
+
+#[test]
+fn settings_gate_opens_when_the_bounded_window_expires() {
+    let _serial = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    struct RestoreGate(std::time::Duration);
+    impl Drop for RestoreGate {
+        fn drop(&mut self) {
+            super::set_settings_gate_max_wait(self.0);
+            super::mark_external_otel_settings_resolved();
+        }
+    }
+    let _restore = RestoreGate(super::settings_gate_max_wait());
+
+    super::set_settings_gate_max_wait(std::time::Duration::from_secs(600));
+    super::suppress_external_otel_until_settings();
+    assert!(
+        !super::is_settings_gate_open(),
+        "inside the window the gate stays fail-closed"
+    );
+
+    super::set_settings_gate_max_wait(std::time::Duration::ZERO);
+    assert!(
+        super::is_settings_gate_open(),
+        "an expired window must resolve the gate open onto local policy"
+    );
+
+    super::set_settings_gate_max_wait(std::time::Duration::from_secs(600));
+    super::suppress_external_otel_until_settings();
+    assert!(
+        !super::is_settings_gate_open(),
+        "re-closing must restart the window, not stay open"
     );
 }
 

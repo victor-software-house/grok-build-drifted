@@ -199,6 +199,15 @@ fi
 echo "{\"access_token\": \"$TOKEN\", \"expires_in\": 3600}"
 ```
 
+The refresh run is headless: stdin is closed and the binary is given a few
+seconds, so it cannot prompt you. If it can't produce a token there — because
+your SSO session lapsed and it needs you to sign in again — Grok stops treating
+the stored credential as usable and starts the interactive flow instead, the
+same one you get on a machine that has never signed in. That run has a long
+timeout and shows your binary's stderr, so a device-code URL or a browser prompt
+reaches you. Mid-session, the turn fails with a re-auth prompt and `/login`
+re-runs the binary interactively.
+
 ### Environment Variables
 
 | Variable | Description |
@@ -271,7 +280,12 @@ During a session, the active method handles all mid-session refreshes.
 
 ## Related settings
 
+<<<<<<< HEAD
 `/privacy` does not change these config knobs:
+=======
+Coding-data sharing — **Coding data, retention, and training** in Settings,
+which `/privacy` opens — does not change these config knobs:
+>>>>>>> 780d1388fff103ff0db0d8c14de65af6225b4860
 
 | Setting | How to set it |
 |---------|---------------|
@@ -279,10 +293,18 @@ During a session, the active method handles all mid-session refreshes.
 | `[telemetry] trace_upload` | `config.toml` or `GROK_TELEMETRY_TRACE_UPLOAD` |
 | External OpenTelemetry | `GROK_EXTERNAL_OTEL` / `[telemetry] otel_*`. See [Monitoring Usage](24-monitoring-usage.md). |
 
+<<<<<<< HEAD
 On team accounts, only a team admin can toggle privacy with `/privacy`.
 Team admins can also enable or disable Zero Data Retention (ZDR) for their team.
 See [How to enable ZDR](https://docs.x.ai/developers/faq/security#how-to-enable-zdr).
 When ZDR is on, `/privacy` cannot change coding-data sharing.
+=======
+On team accounts, only a team admin can change coding-data sharing.
+Team admins can also enable or disable Zero Data Retention (ZDR) for their team.
+See [How to enable ZDR](https://docs.x.ai/developers/faq/security#how-to-enable-zdr).
+When ZDR is on, coding-data sharing cannot be changed at all — the settings
+row shows `ZDR` in place of the value.
+>>>>>>> 780d1388fff103ff0db0d8c14de65af6225b4860
 
 See [Monitoring Usage](24-monitoring-usage.md#related-settings) and [Configuration](05-configuration.md#telemetry).
 
