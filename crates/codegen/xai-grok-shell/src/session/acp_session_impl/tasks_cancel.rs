@@ -176,17 +176,29 @@ async fn run_task(
 }
 
 impl SessionActor {
-    pub(super) fn cancel_running_turn_subagents(&self) {
-        let Some(parent_prompt_id) = self
-            .current_prompt_id
-            .lock()
-            .expect("current_prompt_id mutex poisoned")
-            .clone()
-        else {
-            return;
-        };
+    /// Turn-scoped: soft cancel / max-turns only (not user Stop).
+    /// `parent_prompt_id` is the authoritative turn id from the turn runner.
+    pub(super) fn cancel_running_turn_subagents(&self, parent_prompt_id: &str) {
+        self.cancel_subagents_for_prompt_id(parent_prompt_id);
+    }
 
-        self.cancel_subagents_for_prompt_id(&parent_prompt_id);
+    /// User Stop with cancel_subagents: all non-workflow session children.
+    /// Uses the session-bound backend API so cancel never wildcards other sessions.
+    pub(super) fn cancel_all_session_subagents(&self) {
+        if let Some(event_tx) = self.tool_context.subagent_event_tx.clone() {
+            use xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend;
+            let backend = ChannelBackend::for_session(event_tx, self.session_id_string());
+            let _ = backend.request_cancel_parent_session(tokio::sync::oneshot::channel().0);
+        }
+    }
+
+    /// Re-open Task spawns for this session after a prior user Stop.
+    pub(super) fn open_subagent_spawn_admission(&self) {
+        if let Some(event_tx) = self.tool_context.subagent_event_tx.clone() {
+            use xai_grok_tools::implementations::grok_build::task::backend::ChannelBackend;
+            let backend = ChannelBackend::for_session(event_tx, self.session_id_string());
+            let _ = backend.open_spawn_admission();
+        }
     }
 
     fn cancel_subagents_for_prompt_id(&self, parent_prompt_id: &str) {
@@ -195,6 +207,7 @@ impl SessionActor {
                 SubagentCancelRequest, SubagentCancelTarget, SubagentEvent,
             };
             let _ = event_tx.send(SubagentEvent::Cancel(SubagentCancelRequest {
+                parent_session_id: Some(self.session_id_string()),
                 target: SubagentCancelTarget::ParentPromptId(parent_prompt_id.to_string()),
                 respond_to: tokio::sync::oneshot::channel().0,
             }));
@@ -235,6 +248,12 @@ impl SessionActor {
         trigger: Option<String>,
     ) {
         let suppress_task_wakes = trigger.as_deref() == Some("ctrl_c");
+<<<<<<< HEAD
+=======
+        // Abort in-flight `/compact` or auto-compact generation (stream select +
+        // pre-replace guard). Safe when no compact is running.
+        self.compaction.cancel.request_cancel();
+>>>>>>> a4221165824e5b1f5c4c10b7459f65e78dd6448d
         if suppress_task_wakes {
             if let Some(gate) = &self.tool_context.task_wake_suppressed {
                 gate.set(true);
@@ -289,7 +308,18 @@ impl SessionActor {
         }
 
         if cancel_subagents {
-            self.cancel_running_turn_subagents();
+            // Abort the producer first so it cannot enqueue more TaskTool work
+            // after the ParentSession sweep. Keep the task slot for prompt-id
+            // attribution below; cleanup will take+abort again (idempotent).
+            {
+                let state = self.state.lock().await;
+                if let Some(task) = state.running_task.as_ref() {
+                    task.abort();
+                }
+            }
+            // Then cancel every non-workflow session child (incl. prior turns)
+            // and close spawn admission until the next turn opens it.
+            self.cancel_all_session_subagents();
         }
 
         // Don't count send-now/rewound cancels — they'd skew the cancel-rate signal.
@@ -396,7 +426,11 @@ impl SessionActor {
             //   is no point starting the next prompt and draining resolves every
             //   queued input's `respond_to` cleanly.
             // * normal cancel: remove the running turn; only Ctrl+C also removes
+<<<<<<< HEAD
             //   queued terminal task-completion wakes. Preserve real user prompts
+=======
+            //   queued task/workflow completion wakes. Preserve real user prompts
+>>>>>>> a4221165824e5b1f5c4c10b7459f65e78dd6448d
             //   and unrelated synthetic entries so `maybe_start_running_task` can
             //   promote the next genuine user turn.
             //   The cancelling client does not pull any prompt back into its
@@ -432,7 +466,15 @@ impl SessionActor {
                     if is_running_turn {
                         cancelled.push_back(item);
                     } else if suppress_task_wakes
+<<<<<<< HEAD
                         && matches!(&item.origin, super::PromptOrigin::TaskCompleted { .. })
+=======
+                        && matches!(
+                            &item.origin,
+                            super::PromptOrigin::TaskCompleted { .. }
+                                | super::PromptOrigin::WorkflowCompleted { .. }
+                        )
+>>>>>>> a4221165824e5b1f5c4c10b7459f65e78dd6448d
                     {
                         if let Some(fallback) = item.task_wake_fallback {
                             Self::push_task_wake_fallback(&mut state, fallback);
@@ -543,12 +585,7 @@ impl SessionActor {
         // The aborted turn's `BlockingWaitGuard`s drop asynchronously (they
         // live in tool futures owned by the drainer task / subagent spawn
         // task). Until they do, `queue_input` would read a stale depth > 0 and
-        // auto-send-now-cancel the NEXT turn — dropping its user prompt. Zero
-        // the window here; late guard drops saturate at 0 (see the guard's
-        // `Drop`).
-        self.tool_context
-            .blocking_wait_depth
-            .store(0, std::sync::atomic::Ordering::SeqCst);
+        self.tool_context.blocking_wait_depth.reset();
         self.flush_pending_skill_reminders().await;
 
         // No multi-second drain here (actor loop would block RecordSubagentUsage).
@@ -559,8 +596,10 @@ impl SessionActor {
                 let outcome =
                     super::turn::UsageDrainOutcome::from_outstanding_reply(reply.as_ref());
                 self.finalize_usage_from_outcome(prompt_id, outcome).await
-            } else {
+            } else if !pending_inputs.is_empty() {
                 self.snapshot_prompt_usage().await
+            } else {
+                None
             }
         } else {
             None
@@ -610,6 +649,7 @@ impl SessionActor {
                 completion_kind: PromptCompletionKind::Rewound,
                 structured_output: None,
                 usage: None,
+                tool_overrides: self.effective_tool_overrides(),
             }));
             return;
         }
@@ -651,6 +691,13 @@ impl SessionActor {
                     structured_output: None,
                     usage: if is_running_turn {
                         cancelled_usage.clone()
+                    } else {
+                        None
+                    },
+                    // Only the running turn (idx 0) ran, so only it echoes a bound; a queued prompt
+                    // that never promoted attests nothing (like respond_removed_prompt).
+                    tool_overrides: if is_running_turn {
+                        self.effective_tool_overrides()
                     } else {
                         None
                     },

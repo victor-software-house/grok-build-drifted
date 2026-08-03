@@ -20,10 +20,27 @@ pub struct CancellationContext {
     /// `None` for graceful in-turn cancels and older clients.
     pub trigger: Option<String>,
 }
+/// Failure surface of a `/btw` side question. Kept typed until the ACP
+/// boundary so `handle_btw` can route model errors through the canonical
+/// [`map_sampling_err_to_acp`](crate::sampling::error::map_sampling_err_to_acp)
+/// (typed rate-limit / auth codes) instead of a flattened string.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SideQuestionError {
+    #[error("side question model call failed: {0}")]
+    Sampling(#[from] xai_grok_sampling_types::SamplingError),
+    #[error("failed to prepare client: {0}")]
+    PrepareClient(String),
+    #[error("No response from model")]
+    EmptyResponse,
+}
 /// Prompt completion kind returned to the ACP layer.
 #[derive(Debug, Clone)]
 pub enum PromptCompletionKind {
     Completed,
+    /// Silent EndTurn after stationarity/true-noop thrash. Distinct from
+    /// Completed so goal continuation is not re-queued under an active goal.
+    StationarityEnded,
     Cancelled {
         category: Option<xai_file_utils::events::types::CancellationCategory>,
         context: Option<CancellationContext>,
@@ -55,6 +72,7 @@ pub struct PromptTurnOk {
     /// `Some(Err)` carries a parse/validation error message.
     pub structured_output: Option<Result<serde_json::Value, String>>,
     pub usage: Option<crate::extensions::notification::PromptUsage>,
+    pub tool_overrides: Option<xai_grok_sampling_types::ToolOverrides>,
 }
 /// Result of a prompt turn, containing the stop reason, accumulated token count,
 /// and an optional turn-end signals snapshot (for trace metadata enrichment).
@@ -68,6 +86,7 @@ pub(crate) fn ok_end_turn(tokens: u64, snapshot: Option<TurnDeltaSnapshot>) -> P
         completion_kind: PromptCompletionKind::Completed,
         structured_output: None,
         usage: None,
+        tool_overrides: None,
     })
 }
 /// Pre-parsed prompt metadata sent back to the caller after `parse_prompt`.
@@ -133,6 +152,15 @@ pub enum SessionCommand {
     /// reverse-request so the client re-shows approval chrome over a real live
     /// waiter. Fire-and-forget; the actor spawns the round-trip + decision.
     RestorePlanApproval,
+    GetToolOverrides {
+        respond_to: oneshot::Sender<Option<xai_grok_sampling_types::ToolOverrides>>,
+    },
+    /// Establish the per-turn tool-overrides state before the first prompt runs. Sent once by
+    /// `handle_subagent_request` ahead of the child's first `Prompt`, so a spawned subagent's
+    /// inherited cutoff is applied and published (for its own subagents to read) before any turn.
+    SetToolOverrides {
+        overrides: xai_grok_sampling_types::ToolOverrides,
+    },
     Prompt {
         prompt_id: String,
         prompt_blocks: Vec<acp::ContentBlock>,
@@ -158,6 +186,10 @@ pub enum SessionCommand {
         send_now: bool,
         /// Actor-authoritative admission and deferred fallback for terminal task wakes.
         admission: Option<TaskWakeAdmission>,
+<<<<<<< HEAD
+=======
+        tool_overrides_update: Option<xai_grok_sampling_types::ToolOverridesUpdate>,
+>>>>>>> a4221165824e5b1f5c4c10b7459f65e78dd6448d
         respond_to: oneshot::Sender<PromptTurnResult>,
         /// Optional oneshot fired after the user message has been appended to
         /// chat history and a persistence flush barrier has completed, before
@@ -562,6 +594,15 @@ pub enum SessionCommand {
         new_text: String,
         editor: Option<String>,
     },
+    /// Hold a queued prompt out of combine-on-promote while a client edits it
+    /// in the composer. Released via [`Self::ReleaseCombineEdit`].
+    HoldCombineEdit {
+        id: String,
+    },
+    /// Release a previous [`Self::HoldCombineEdit`].
+    ReleaseCombineEdit {
+        id: String,
+    },
     /// Atomically interject a queued (not-yet-running) prompt into the running
     /// turn: the actor removes it from `pending_inputs` and pushes
     /// its text into `pending_interjections` in a single mailbox op, so the
@@ -611,6 +652,12 @@ pub enum SessionCommand {
     /// files and is included in GCS CopyFile snapshots.
     PersistFeedback(Box<crate::session::persistence::LocalFeedbackEntry>),
     AdvertiseCommands,
+    GetWorkflowCatalogState {
+        respond_to: oneshot::Sender<(bool, bool)>,
+    },
+    ListAvailableCommands {
+        respond_to: oneshot::Sender<crate::session::slash_commands::ListCommandsResponse>,
+    },
     /// Re-discover skills from disk, update the SkillManager baseline,
     /// and re-advertise slash commands to the client.
     ReloadSkills,
@@ -638,7 +685,7 @@ pub enum SessionCommand {
     /// tool-free model call, and returns the response text.
     SideQuestion {
         question: String,
-        respond_to: oneshot::Sender<Result<String, String>>,
+        respond_to: oneshot::Sender<Result<String, SideQuestionError>>,
     },
     /// Generate a session recap (a short "where was I" summary) and broadcast
     /// it to clients via `SessionUpdate::SessionRecap`.
@@ -705,6 +752,10 @@ pub enum SessionCommand {
     GoalSummaryTurn {
         /// Short instruction appended as a verbatim user message.
         prompt_text: String,
+    },
+    WorkflowCompletionTurn {
+        run_id: String,
+        revision: u64,
     },
     /// Take turn messages from the chat state actor (proxied from mvp_agent).
     TakeTurnMessages {
