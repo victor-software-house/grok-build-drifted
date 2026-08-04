@@ -11,6 +11,7 @@ pub mod doom_loop;
 pub mod error;
 pub mod messages;
 pub mod serde_helpers;
+pub mod tool_overrides;
 pub mod types;
 
 pub use self::conversation::*;
@@ -20,7 +21,15 @@ pub use self::doom_loop::{
 };
 pub use self::error::{
     EmptyReason, EmptyResponseContext, ResponseModelMetadata, Result, SamplingError,
+<<<<<<< HEAD
     is_context_length_error, status_user_message, user_facing_api_error_message,
+=======
+    SentCredential, is_context_length_error, status_user_message, user_facing_api_error_message,
+};
+pub use self::tool_overrides::{
+    ClearableField, SearchDateBound, SearchDateBoundError, ToolOverrides, ToolOverridesUpdate,
+    WebSearchOptions, XSearchOptions,
+>>>>>>> e5478eff1e4050558e12e1328b85e6616632efb6
 };
 pub use self::types::*;
 

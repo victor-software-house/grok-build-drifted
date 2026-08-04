@@ -2,7 +2,10 @@
 
 use super::ctx::with_active_agent;
 use super::queue::{maybe_drain_queue, note_peek_page_flip};
+<<<<<<< HEAD
 use super::session::lifecycle::skip_picker_and_create_session;
+=======
+>>>>>>> e5478eff1e4050558e12e1328b85e6616632efb6
 use super::settings::ui::{refresh_open_settings_modals, save_success_toast};
 use crate::app::actions::Effect;
 use crate::app::app_view::{ActiveView, AppView};
@@ -327,10 +330,7 @@ pub(super) fn set_yolo_mode_inner(app: &mut AppView, new: bool) {
                     .ok();
             }
         }
-        // Restore stashed prompt since queue is now empty.
-        if let Some(stashed) = agent.permission_stashed_prompt.take() {
-            agent.prompt.restore(stashed);
-        }
+        super::permissions::restore_permission_stashes(agent);
     }
 
     // Telemetry + tracing guarded on real state change only.
@@ -759,9 +759,10 @@ fn dispatch_cycle_mode_inner(app: &mut AppView) -> Vec<Effect> {
         // Persist the displayed mode to disk like the with-session arms do —
         // otherwise a restart re-reads the stale launch value (e.g. cycling
         // Always-Approve off pre-session still relaunched in yolo).
-        // `session_id: None` skips the ACP yolo_mode_changed push (nothing to
-        // notify yet; the created session takes its mode from the explicit
-        // `_meta` seeds — see `SessionFlags::to_meta`).
+        // `session_id: None` skips the ACP yolo_mode_changed push because there is no session to address yet.
+        // Known gap: the `_meta` seeds were already frozen when CreateSession went out, so a yolo or auto choice made
+        // here reaches the shell only on the next explicit switch. Plan is the one mode that replays, via
+        // `deferred_session_mode` in `handle_session_created`.
         if let Some(canonical) = persist_canonical {
             effects.push(Effect::PersistPermissionMode {
                 canonical,
@@ -769,7 +770,6 @@ fn dispatch_cycle_mode_inner(app: &mut AppView) -> Vec<Effect> {
                 persist: crate::app::actions::PermissionModePersist::BestEffort,
             });
         }
-        effects.extend(skip_picker_and_create_session(app, id));
         return effects;
     };
 
