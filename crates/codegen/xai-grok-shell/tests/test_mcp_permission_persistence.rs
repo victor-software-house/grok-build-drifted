@@ -157,7 +157,11 @@ async fn request(handle: &PermissionHandle, access: AccessKind, id: &str) -> Dec
     let cmd = PermissionCommand::Request {
         access,
         tool_call_update: tool_call_update(id, "mcp"),
+<<<<<<< HEAD
         edit_path_context: None,
+=======
+        path_context: None,
+>>>>>>> ed6d543643628663873c5de28298e022ed634238
         respond_to: tx,
         session_id: None,
         subagent_type: None,
