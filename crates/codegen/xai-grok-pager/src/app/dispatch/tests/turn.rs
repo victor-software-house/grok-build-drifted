@@ -2,6 +2,27 @@
 
 use super::*;
 
+#[test]
+fn demote_dispatch_keeps_turn_session_and_execute_guards() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+
+    assert!(dispatch(Action::DemoteToBackground, &mut app).is_empty());
+
+    crate::app::agent_view::test_fixtures::add_running_execute(app.agents.get_mut(&id).unwrap());
+    let effects = dispatch(Action::DemoteToBackground, &mut app);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::DemoteToBackground {
+            session_id,
+            tool_call_id,
+        }] if session_id.0.as_ref() == "test-session" && tool_call_id == "exec-1"
+    ));
+
+    app.agents.get_mut(&id).unwrap().session.state = AgentState::Idle;
+    assert!(dispatch(Action::DemoteToBackground, &mut app).is_empty());
+}
+
 /// Regression (leader mode): a queued prompt's parked `session/prompt` RPC
 /// can resolve as an *error* — e.g. its `respond_to` is dropped on the
 /// leader when the prompt is removed from the shared queue, surfacing as
@@ -261,6 +282,7 @@ fn cancel_turn_leaves_shared_queue_for_agent_to_drain() {
                 kind: "prompt".into(),
                 text: "first queued".into(),
                 position: 0,
+                combined_texts: None,
             },
             QueueEntryWire {
                 id: "q2".into(),
@@ -270,6 +292,7 @@ fn cancel_turn_leaves_shared_queue_for_agent_to_drain() {
                 kind: "prompt".into(),
                 text: "second queued".into(),
                 position: 1,
+                combined_texts: None,
             },
         ];
         assert!(agent.prompt.text().is_empty());
@@ -720,6 +743,7 @@ fn reconcile_applies_stashed_running_adoption() {
         crate::app::acp_handler::PendingRunningAdoption {
             prompt_id: "pid-next".into(),
             text: Some("queued prompt".into()),
+            combined_texts: None,
             kind: "prompt".into(),
             turn_ended: false,
         },
@@ -746,6 +770,65 @@ fn reconcile_applies_stashed_running_adoption() {
         "the promoted prompt is the new running turn"
     );
     assert!(!app.pending_running_adoptions.contains_key(&id));
+}
+
+/// The reconcile rail's `stop_reason == "error"` arm: formats the raw
+/// agent_result and skips the marker when a dedicated banner already
+/// explains the failure.
+#[test]
+fn reconcile_error_formats_marker_and_defers_to_banner() {
+    fn run(with_banner: bool) -> Option<String> {
+        let mut app = test_app_with_agent();
+        let id = AgentId(0);
+        {
+            let agent = app.agents.get_mut(&id).unwrap();
+            agent.session.state = AgentState::TurnRunning;
+            agent.session.current_prompt_id = Some("pid-stuck".into());
+            if with_banner {
+                agent.scrollback.push_block(RenderBlock::session_event(
+                    SessionEvent::RequestFailed {
+                        status: Some(500),
+                        headline: "Server error (500)".into(),
+                        detail: String::new(),
+                    },
+                ));
+            }
+            agent.pending_turn_end_reconcile = Some(crate::app::agent_view::PendingTurnEnd {
+                prompt_id: "pid-stuck".into(),
+                stop_reason: Some("error".into()),
+                agent_result: Some("boom".into()),
+                cancel_trigger: None,
+                received_at: std::time::Instant::now()
+                    - (TURN_END_RECONCILE_GRACE + std::time::Duration::from_secs(1)),
+            });
+        }
+        let fired = reconcile_overdue_turn_ends(&mut app);
+        assert!(
+            fired.is_some(),
+            "the overdue reconcile must finish the turn"
+        );
+        let agent = &app.agents[&id];
+        (0..agent.scrollback.len()).find_map(|i| {
+            match agent.scrollback.entry(i).map(|e| &e.block) {
+                Some(RenderBlock::SessionEvent(ev)) => match &ev.event {
+                    SessionEvent::TurnFailed { error, .. } => Some(error.clone()),
+                    _ => None,
+                },
+                _ => None,
+            }
+        })
+    }
+
+    assert_eq!(
+        run(false).as_deref(),
+        Some("Request failed \u{2014} boom. Try sending again."),
+        "the raw agent_result must render as a formatted marker"
+    );
+    assert_eq!(
+        run(true),
+        None,
+        "a dedicated banner must suppress the reconcile's TurnFailed marker"
+    );
 }
 
 #[test]
@@ -913,6 +996,101 @@ fn cancel_after_first_activity_does_not_restore() {
     );
     // user_prompt + TurnCancelled banner.
     assert_eq!(app.agents[&id].scrollback.len(), 2);
+}
+
+/// Ctrl+C rewind of a locally-drained combined turn must remove *every*
+/// per-segment user bubble (not just the last) and restore the joined text.
+#[test]
+fn cancel_rewind_removes_all_combined_segment_blocks() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let (first_id, last_id) = {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.state = AgentState::TurnRunning;
+        agent.session.current_prompt_id = Some("p-combo".into());
+        // One bubble per original follow-up, as a combined drain paints them.
+        let first_id = agent
+            .scrollback
+            .push_block(RenderBlock::user_prompt("first"));
+        let last_id = agent
+            .scrollback
+            .push_block(RenderBlock::user_prompt("second"));
+        agent.session.in_flight_prompt = Some(crate::app::agent::InFlightPrompt {
+            text: "first\n\nsecond".into(),
+            images: Vec::new(),
+            scrollback_entry: last_id,
+            combined_scrollback_entries: vec![first_id],
+            chip_elements: Vec::new(),
+        });
+        (first_id, last_id)
+    };
+
+    let _ = dispatch(Action::CancelTurn, &mut app);
+
+    let agent = &app.agents[&id];
+    assert!(
+        agent.scrollback.index_of_id(first_id).is_none(),
+        "the earlier segment bubble must also be removed on rewind"
+    );
+    assert!(
+        agent.scrollback.index_of_id(last_id).is_none(),
+        "the primary segment bubble must be removed on rewind"
+    );
+    assert_eq!(
+        agent.prompt.text(),
+        "first\n\nsecond",
+        "the joined combined text is restored into the composer"
+    );
+}
+
+/// A cancel landing before first server activity must NOT rewind the stashed
+/// in-flight prompt over a NEWER composer draft. Esc (and the mouse stop /
+/// palette cancel) fire with the draft intact — unlike keyboard Ctrl+C,
+/// which only cancels on an empty prompt — so the pristine rewind falls back
+/// to the standard cancel and the draft survives.
+#[test]
+fn cancel_with_newer_draft_skips_pristine_rewind_and_keeps_draft() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let sent_id = {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.state = AgentState::TurnRunning;
+        agent.session.current_prompt_id = Some("p-sent".into());
+        let sent_id = agent
+            .scrollback
+            .push_block(RenderBlock::user_prompt("sent prompt"));
+        agent.session.in_flight_prompt = Some(crate::app::agent::InFlightPrompt {
+            text: "sent prompt".into(),
+            images: Vec::new(),
+            scrollback_entry: sent_id,
+            combined_scrollback_entries: Vec::new(),
+            chip_elements: Vec::new(),
+        });
+        // Typed WHILE the turn was starting — newer than the stash.
+        agent.prompt.set_text("newer draft");
+        sent_id
+    };
+
+    let effects = dispatch(Action::CancelTurn, &mut app);
+    assert!(
+        matches!(effects.as_slice(), [Effect::CancelTurn { .. }]),
+        "cancel still flies to the server, got {effects:?}"
+    );
+
+    let agent = &app.agents[&id];
+    assert_eq!(
+        agent.prompt.text(),
+        "newer draft",
+        "the composer draft must survive the cancel (no rewind clobber)"
+    );
+    assert!(
+        agent.scrollback.index_of_id(sent_id).is_some(),
+        "standard cancel keeps the sent prompt's block (no rewind removal)"
+    );
+    assert!(
+        agent.session.state.is_cancelling(),
+        "standard cancel path (TurnCancelling), not the rewind-Idle"
+    );
 }
 
 #[test]

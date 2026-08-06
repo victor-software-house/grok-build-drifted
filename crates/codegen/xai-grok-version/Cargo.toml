@@ -1,7 +1,11 @@
 [package]
 license = "Apache-2.0"
 name = "xai-grok-version"
+<<<<<<< HEAD
 version = "0.2.105"
+=======
+version = "0.2.120"
+>>>>>>> a5589e958437d79e13db026eedcb1720bffd4063
 edition.workspace = true
 description = "Lockstepped grok CLI version."
 

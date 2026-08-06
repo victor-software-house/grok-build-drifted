@@ -5,6 +5,10 @@
     unreachable_code,
     dead_code
 )]
+<<<<<<< HEAD
+=======
+#![warn(unreachable_pub)]
+>>>>>>> a5589e958437d79e13db026eedcb1720bffd4063
 #[cfg(all(test, feature = "dhat-heap"))]
 #[global_allocator]
 static DHAT_ALLOC: dhat::Alloc = dhat::Alloc;
@@ -41,6 +45,5 @@ pub mod terminal;
 pub(crate) mod test_support;
 pub mod tier;
 pub mod tools;
-pub mod trace_classifier;
 pub mod upload;
 pub mod util;
