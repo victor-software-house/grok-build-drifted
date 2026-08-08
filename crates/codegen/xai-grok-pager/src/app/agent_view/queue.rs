@@ -3,8 +3,8 @@
 
 #[cfg(test)]
 use super::test_fixtures;
-use super::{AgentPane, AgentView, ParkedMarkerSlot, PromptMode, overlay_action_to_outcome};
-use crate::actions::ActionRegistry;
+use super::{AgentPane, AgentView, PromptMode, overlay_action_to_outcome};
+use crate::actions::{ActionId, ActionRegistry};
 use crate::app::actions::Action;
 use crate::app::app_view::InputOutcome;
 use crossterm::event::KeyEvent;
@@ -76,8 +76,8 @@ impl AgentView {
     /// the wait as user-interruptible would lie there).
     ///
     /// Gates Enter interjecting instead of queueing and the parked queue
-    /// drain. The stopped-session *rendering* additionally requires the
-    /// parked-marker slot to be consumed — see [`Self::renders_parked`].
+    /// drain. The stopped-session *rendering* additionally excludes subagent
+    /// waits — see [`Self::renders_parked`].
     /// Purely view-derived — reading it has no turn-lifecycle side effects.
     pub(crate) fn is_parked_on_sendable_wait(&self) -> bool {
         crate::views::turn_status::is_sendable_wait(&self.resolve_turn_activity())
@@ -88,13 +88,11 @@ impl AgentView {
     }
 
     /// Whether an explicit send-now dispatched right now will actually cancel
-    /// the running turn shell-side (`cancel_running_turn = send_now &&
-    /// turn_running && !goal_active`) — the arming predicate for
-    /// [`Self::expect_send_now_cancel`]. During an active goal the shell only
-    /// promotes the prompt (no cancel), so arming would leave a stale
-    /// expectation that suppresses a later real cancel's marker.
+    /// the running turn shell-side. Also requires the front committed so a
+    /// spared send-now does not paint under later output from that front.
     pub(crate) fn expects_send_now_cancel(&self) -> bool {
         self.session.state.is_turn_running()
+            && self.front_message_committed
             && !self
                 .goal_state
                 .as_ref()
@@ -114,7 +112,7 @@ impl AgentView {
     }
 
     /// The current wait is a foreground subagent await — sendable, but excluded
-    /// from the parked marker (the parent is blocked, not completed; the
+    /// from the parked look (the parent is blocked, not completed; the
     /// subagent reports its own progress).
     pub(crate) fn is_waiting_on_subagent(&self) -> bool {
         use crate::acp::tracker::{TurnActivity, WaitingReason};
@@ -124,6 +122,7 @@ impl AgentView {
         )
     }
 
+<<<<<<< HEAD
     /// The wait can only return imminently: every awaited id is already
     /// terminal, or a wait-all sees zero running work. Unknown ids and Sleep
     /// are never imminent. Callers must pre-gate on
@@ -284,6 +283,8 @@ impl AgentView {
         }
     }
 
+=======
+>>>>>>> afbc0fb710320c7add294c2106d447ecc3e3af2e
     /// Visible held rows for the "N queued" hint. 0 outside sendable waits.
     pub(crate) fn held_queue_count(&self) -> usize {
         // Goal-gated via `is_parked_on_sendable_wait` (0 during a goal — shell exempts goal turns).
@@ -369,20 +370,13 @@ impl AgentView {
         );
     }
 
-    /// Whether the stopped-session look is active: the parked-marker slot for
-    /// the current turn was consumed (marker pushed, or forgone because an
-    /// interjection continued the parked turn) and the turn is still in its
-    /// sendable wait. Drives hiding the turn-status row and the idle keybar;
-    /// flips back off (the running chrome returns) the moment the wait ends
-    /// and the turn resumes.
+    /// Whether the stopped-session look is active: the turn is parked in a
+    /// sendable wait that is not a foreground subagent await. Purely
+    /// view-derived — no transcript row is written for a park. Drives the
+    /// idle keybar and the parked turn-status cue; flips back off (the
+    /// running chrome returns) the moment the wait ends and the turn resumes.
     pub(crate) fn renders_parked(&self) -> bool {
-        self.parked_wait_marker_for
-            .as_ref()
-            .zip(self.session.current_prompt_id.as_deref())
-            .is_some_and(|(slot, pid)| slot.prompt_id() == pid)
-            && self.is_parked_on_sendable_wait()
-            // Subagent waits keep running chrome — exclude them from the stopped look.
-            && !self.is_waiting_on_subagent()
+        self.is_parked_on_sendable_wait() && !self.is_waiting_on_subagent()
     }
 
     /// Live counts for the turn-status watching cue; see
@@ -405,8 +399,16 @@ impl AgentView {
         watchers.subagents = self
             .subagent_sessions
             .values()
-            .filter(|s| s.is_running())
+            .filter(|s| s.is_running() && s.workflow_run_id.is_none())
             .count();
+<<<<<<< HEAD
+=======
+        watchers.workflows = self
+            .workflow_runs
+            .iter()
+            .filter(|run| run.is_active())
+            .count();
+>>>>>>> afbc0fb710320c7add294c2106d447ecc3e3af2e
         watchers
     }
 
@@ -664,10 +666,6 @@ impl AgentView {
                             if self.visible_queue_is_empty() {
                                 self.hide_queue_pane();
                             }
-                            // Deleting the last held row can flip the parked
-                            // look on now (the ACP rebroadcast re-checks too,
-                            // but the optimistic remove shouldn't lag).
-                            self.maybe_push_parked_marker();
                             return InputOutcome::Action(Action::QueueRemoveShared {
                                 id: server_id,
                                 expected_version: row.version,
@@ -677,11 +675,6 @@ impl AgentView {
                     }
                     // No drain kick (cf. mouse [cancel]): queue focus is unreachable mid-edit.
                     self.remove_local_queue_row(id);
-                    // A LOCAL delete has no server rebroadcast to re-evaluate
-                    // the parked look — deleting the last held row must flip
-                    // the stopped chrome on immediately, not on the next
-                    // unrelated notification.
-                    self.maybe_push_parked_marker();
                 }
                 QueueEvent::EditSelected { id } => {
                     // Entry into editing mode lives in `queue_edit.rs`.
@@ -710,6 +703,9 @@ impl AgentView {
                     self.session.swap_prompt_down(id);
                 }
                 QueueEvent::ForceInterject { id } => {
+                    // Same InterjectPrompt chord as the prompt; surface is the
+                    // queue pane (not When::PromptFocused).
+                    crate::actions::log_shortcut_used(key, ActionId::InterjectPrompt, "queue");
                     return self.force_interject_queue_row(id);
                 }
             }
@@ -870,6 +866,7 @@ mod queue_edit_routing_tests {
             last_editor: None,
             kind: "prompt".into(),
             text: format!("server {id}"),
+            combined_texts: None,
             position,
         }
     }
@@ -1339,6 +1336,7 @@ mod queue_edit_routing_tests {
                 kind: "prompt".into(),
                 text: "first".into(),
                 position: 0,
+                combined_texts: None,
             },
             QueueEntryWire {
                 id: "p2".into(),
@@ -1348,6 +1346,7 @@ mod queue_edit_routing_tests {
                 kind: "prompt".into(),
                 text: "second".into(),
                 position: 1,
+                combined_texts: None,
             },
         ];
         agent.session.pending_prompts.clear();
@@ -1735,8 +1734,38 @@ mod queue_edit_routing_tests {
 
 #[cfg(test)]
 mod watcher_tests {
+<<<<<<< HEAD
     use super::super::test_agent_view;
     use crate::views::turn_status::Watchers;
+=======
+    use super::super::{test_agent_view, test_fixtures};
+    use crate::views::turn_status::Watchers;
+    use crate::views::workflows::WorkflowRunSnapshot;
+
+    fn active_workflow(run_id: &str) -> WorkflowRunSnapshot {
+        WorkflowRunSnapshot {
+            run_id: run_id.to_owned(),
+            name: "workflow".to_owned(),
+            objective: "objective".to_owned(),
+            status: "active".to_owned(),
+            management_available: true,
+            builtin: false,
+            phases: Vec::new(),
+            current_phase: None,
+            agents: Vec::new(),
+            agent_budget: None,
+            agents_used: 0,
+            agents_reserved: 0,
+            agents_remaining: None,
+            agent_usage_incomplete: false,
+            active_agents: 0,
+            elapsed_ms: 0,
+            received_at: std::time::Instant::now(),
+            pause_message: None,
+            result_summary: None,
+        }
+    }
+>>>>>>> afbc0fb710320c7add294c2106d447ecc3e3af2e
 
     fn insert_bg_task(
         agent: &mut crate::app::agent_view::AgentView,
@@ -1784,6 +1813,59 @@ mod watcher_tests {
                 monitors: 1,
                 loops: 0,
                 subagents: 0,
+<<<<<<< HEAD
+=======
+                workflows: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn workflow_children_coalesce_into_one_workflow_watcher() {
+        let mut agent = test_agent_view(Some("s1"), std::path::PathBuf::from("/tmp"));
+        agent.workflow_runs.push(active_workflow("wf-1"));
+        let mut child_a = test_fixtures::running_subagent_info("child-a");
+        child_a.workflow_run_id = Some("wf-1".into());
+        let mut child_b = test_fixtures::running_subagent_info("child-b");
+        child_b.workflow_run_id = Some("wf-1".into());
+        agent.subagent_sessions.insert("child-a".into(), child_a);
+        agent.subagent_sessions.insert("child-b".into(), child_b);
+
+        assert_eq!(
+            agent.watchers(),
+            Watchers {
+                commands: 0,
+                monitors: 0,
+                loops: 0,
+                subagents: 0,
+                workflows: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn standalone_subagent_and_workflow_remain_distinct_watchers() {
+        let mut agent = test_agent_view(Some("s1"), std::path::PathBuf::from("/tmp"));
+        agent.workflow_runs.push(active_workflow("wf-1"));
+        let mut workflow_child = test_fixtures::running_subagent_info("workflow-child");
+        workflow_child.workflow_run_id = Some("wf-1".into());
+        agent
+            .subagent_sessions
+            .insert("workflow-child".into(), workflow_child);
+        agent.subagent_sessions.insert(
+            "standalone-child".into(),
+            test_fixtures::running_subagent_info("standalone-child"),
+        );
+
+        assert_eq!(
+            agent.watchers(),
+            Watchers {
+                commands: 0,
+                monitors: 0,
+                loops: 0,
+                subagents: 1,
+                workflows: 1,
+>>>>>>> afbc0fb710320c7add294c2106d447ecc3e3af2e
             }
         );
     }

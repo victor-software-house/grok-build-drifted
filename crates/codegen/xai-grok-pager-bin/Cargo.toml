@@ -1,6 +1,10 @@
 [package]
 name = "xai-grok-pager-bin"
+<<<<<<< HEAD
 version = "0.2.105"
+=======
+version = "1.0.0"
+>>>>>>> afbc0fb710320c7add294c2106d447ecc3e3af2e
 edition.workspace = true
 license = "Apache-2.0"
 authors = ["xAI"]
@@ -90,7 +94,9 @@ default = [
 default-bazel = [
     "jemalloc",
     "sandbox-enforce",
+    "local-workspace",
     ]
 jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-sys", "dep:tikv-jemalloc-ctl"]
 sandbox-enforce = ["xai-grok-pager/sandbox-enforce"]
+local-workspace = ["xai-grok-pager/local-workspace"]
 release-dist = ["xai-grok-pager/release-dist"]
