@@ -38,6 +38,7 @@ fn detector_entry(
         info,
         api_key: None,
         env_key: None,
+        auth_provider: None,
         api_base_url: None,
     }
 }
@@ -337,6 +338,10 @@ async fn idle_recheck_after_sleep_short_circuits_silently() {
                         json_schema: None,
                         origin: crate::session::PromptOrigin::User,
                         task_wake_fallback: None,
+<<<<<<< HEAD
+=======
+                        tool_overrides_update: None,
+>>>>>>> 8a14c91d88875a831a38b3a066b1683116bcb31c
                         respond_to,
                         persist_ack: None,
                         parsed_prompt_tx: None,
