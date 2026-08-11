@@ -1,6 +1,10 @@
 {
   "default": "grok-4.5",
+<<<<<<< HEAD
   "web_search": "grok-4.20-multi-agent",
+=======
+  "web_search": "grok-4.5",
+>>>>>>> b13fa526f5112c0b20dad5f1f2300d3d3b127895
   "image_description": "grok-4.5",
   "session_summary": "grok-4.5",
   "models": [

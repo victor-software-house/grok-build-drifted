@@ -72,6 +72,10 @@ pub(crate) struct ShellCompactionSampler {
     /// reasoning-runaway backstop; `0` disables it.
     wall_clock_budget_secs: u64,
     tool_choice: crate::util::config::CompactionToolChoice,
+<<<<<<< HEAD
+=======
+    cancel: tokio_util::sync::CancellationToken,
+>>>>>>> b13fa526f5112c0b20dad5f1f2300d3d3b127895
     /// Full output of the most recent successful sample (for L5 telemetry).
     last_success: Mutex<Option<CompactOutput>>,
 }
@@ -89,6 +93,10 @@ impl ShellCompactionSampler {
         idle_timeout: Duration,
         wall_clock_budget_secs: u64,
         tool_choice: crate::util::config::CompactionToolChoice,
+<<<<<<< HEAD
+=======
+        cancel: tokio_util::sync::CancellationToken,
+>>>>>>> b13fa526f5112c0b20dad5f1f2300d3d3b127895
     ) -> Self {
         Self {
             use_short_prompt,
@@ -101,6 +109,10 @@ impl ShellCompactionSampler {
             idle_timeout,
             wall_clock_budget_secs,
             tool_choice,
+<<<<<<< HEAD
+=======
+            cancel,
+>>>>>>> b13fa526f5112c0b20dad5f1f2300d3d3b127895
             last_success: Mutex::new(None),
         }
     }
@@ -140,6 +152,10 @@ impl CompactionSampler for ShellCompactionSampler {
             self.idle_timeout,
             self.wall_clock_budget_secs,
             self.tool_choice,
+<<<<<<< HEAD
+=======
+            &self.cancel,
+>>>>>>> b13fa526f5112c0b20dad5f1f2300d3d3b127895
         )
         .await
         {
@@ -170,6 +186,7 @@ fn compact_failure_to_sample_error(failure: CompactFailure) -> CompactionSampleE
     let (deterministic, err) = match failure {
         CompactFailure::Deterministic(err) => (true, err),
         CompactFailure::Transient(err) => (false, err),
+        CompactFailure::Cancelled => (true, CompactFailure::cancelled_error()),
     };
     let message = acp_error_message(&err);
     if deterministic {

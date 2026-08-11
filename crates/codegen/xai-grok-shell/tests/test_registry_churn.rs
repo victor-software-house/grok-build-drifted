@@ -4,6 +4,7 @@
 //! to its pre-churn baseline. Deterministic counts, no memory thresholds.
 //! Counts the echo workload never populates are pinned at their zero
 //! baseline only.
+<<<<<<< HEAD
 use agent_client_protocol::{self as acp, Agent as _};
 use serde_json::json;
 use std::sync::Arc;
@@ -19,11 +20,22 @@ use xai_grok_shell::agent::mvp_agent::MvpAgent;
 use xai_grok_test_support::MockInferenceServer;
 /// Matches production's `MAX_BUFFER_SIZE` in `agent::app`.
 const DUPLEX_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+=======
+mod acp_harness;
+use acp_harness::{
+    AutoApproveClient, connect_and_auth, ext_method, new_session, prompt_turn, run_agent_test,
+};
+use agent_client_protocol as acp;
+use serde_json::json;
+>>>>>>> b13fa526f5112c0b20dad5f1f2300d3d3b127895
 /// Enough that a per-cycle leak is unambiguous; well under a minute
 /// against the loopback mock.
 const CHURN_SESSIONS: usize = 15;
 const CONCURRENT_SESSIONS: usize = 4;
+<<<<<<< HEAD
 const RPC_TIMEOUT: Duration = Duration::from_secs(60);
+=======
+>>>>>>> b13fa526f5112c0b20dad5f1f2300d3d3b127895
 /// Field names are the wire contract (`RegistrySnapshot` in
 /// `agent/mvp_agent/session_lifecycle.rs`); `deny_unknown_fields` forces a
 /// new server-side count to be mirrored and asserted here.
@@ -31,7 +43,15 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(60);
 #[serde(deny_unknown_fields)]
 struct Counts {
     sessions: usize,
+<<<<<<< HEAD
     session_threads: usize,
+=======
+    loading_sessions: usize,
+    session_registry_entries: usize,
+    session_threads: usize,
+    resident_resources: usize,
+    retained_resources: usize,
+>>>>>>> b13fa526f5112c0b20dad5f1f2300d3d3b127895
     dispatch_locks: usize,
     session_turn_numbers: usize,
     permission_event_receivers: usize,
@@ -42,6 +62,7 @@ struct Counts {
     subagent_pending: usize,
     subagent_active: usize,
     subagent_completed: usize,
+<<<<<<< HEAD
     workspace_bindings: Option<usize>,
 }
 struct AutoApproveClient;
@@ -83,12 +104,18 @@ async fn ext_method(
     .unwrap_or_else(|_| panic!("{method} timed out"))
     .unwrap_or_else(|e| panic!("{method} failed: {e}"));
     serde_json::from_str(resp.0.get()).unwrap_or_else(|e| panic!("{method}: bad response: {e}"))
+=======
+    subagent_queued: usize,
+    workspace_bindings: Option<usize>,
+    workspace_activity_sessions: Option<usize>,
+>>>>>>> b13fa526f5112c0b20dad5f1f2300d3d3b127895
 }
 async fn read_counts(conn: &acp::ClientSideConnection) -> Counts {
     let resp = ext_method(conn, "x.ai/debug/agent", json!({})).await;
     serde_json::from_value(resp["result"]["registries"].clone())
         .unwrap_or_else(|e| panic!("x.ai/debug/agent: bad registries payload: {e}\n{resp}"))
 }
+<<<<<<< HEAD
 async fn new_session(conn: &acp::ClientSideConnection, cwd: &std::path::Path) -> acp::SessionId {
     tokio::time::timeout(
         RPC_TIMEOUT,
@@ -121,12 +148,30 @@ async fn prompt_turn(conn: &acp::ClientSideConnection, session_id: &acp::Session
         session_id.0,
         resp.stop_reason
     );
+=======
+/// Counts read once the actor threads are reaped. Nothing signals a thread
+/// exit, so this polls; both ends settle, so neither catches one mid-exit.
+async fn settled_counts(conn: &acp::ClientSideConnection) -> Counts {
+    let mut counts = read_counts(conn).await;
+    for _ in 0..100 {
+        if counts.session_threads == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        counts = read_counts(conn).await;
+    }
+    counts
+>>>>>>> b13fa526f5112c0b20dad5f1f2300d3d3b127895
 }
 async fn close_session(conn: &acp::ClientSideConnection, session_id: &acp::SessionId) {
     let resp = ext_method(
         conn,
         "x.ai/session/close",
+<<<<<<< HEAD
         json!({ "sessionId" : session_id.0.as_ref() }),
+=======
+        json!({ "sessionId": session_id.0.as_ref() }),
+>>>>>>> b13fa526f5112c0b20dad5f1f2300d3d3b127895
     )
     .await;
     assert_eq!(
@@ -141,6 +186,7 @@ async fn churn_one(conn: &acp::ClientSideConnection, cwd: &std::path::Path, labe
     prompt_turn(conn, &sid, &format!("churn ping {label}")).await;
     close_session(conn, &sid).await;
 }
+<<<<<<< HEAD
 /// Builds the in-process agent from the environment and returns an
 /// initialized, authenticated client connection over duplex pipes. IO
 /// tasks spawn on the current `LocalSet`.
@@ -248,19 +294,51 @@ fn session_churn_returns_registry_snapshot_to_baseline() {
         let client_conn = connect_and_auth().await;
         churn_one(&client_conn, workdir.path(), 0).await;
         let baseline = read_counts(&client_conn).await;
+=======
+#[test]
+fn session_churn_returns_registry_snapshot_to_baseline() {
+    run_agent_test(|cwd, _mock| async move {
+        let conn = connect_and_auth(AutoApproveClient, "registry-churn-test")
+            .await
+            .0;
+        churn_one(&conn, &cwd, 0).await;
+        let baseline = settled_counts(&conn).await;
+>>>>>>> b13fa526f5112c0b20dad5f1f2300d3d3b127895
         assert_eq!(
             baseline.sessions, 0,
             "warmup session must be fully removed before baseline"
         );
         assert_eq!(
+<<<<<<< HEAD
             baseline.workspace_bindings,
             Some(0),
             "warmup must have built the local workspace and released its binding"
+=======
+            (
+                baseline.session_registry_entries,
+                baseline.resident_resources,
+                baseline.retained_resources,
+                baseline.loading_sessions
+            ),
+            (0, 0, 0, 0),
+            "warmup must leave no per-session resource entries, including \
+             entries holding no resources"
+        );
+        assert_eq!(
+            (
+                baseline.workspace_bindings,
+                baseline.workspace_activity_sessions
+            ),
+            (Some(0), Some(0)),
+            "warmup must have built the local workspace and released both its \
+             binding and its activity record"
+>>>>>>> b13fa526f5112c0b20dad5f1f2300d3d3b127895
         );
         assert_eq!(
             (
                 baseline.subagent_pending,
                 baseline.subagent_active,
+<<<<<<< HEAD
                 baseline.subagent_completed
             ),
             (0, 0, 0),
@@ -275,6 +353,23 @@ fn session_churn_returns_registry_snapshot_to_baseline() {
             futures::future::join_all((0..CONCURRENT_SESSIONS).map(|_| new_session(conn, cwd)))
                 .await;
         let mid = read_counts(&client_conn).await;
+=======
+                baseline.subagent_completed,
+                baseline.subagent_queued
+            ),
+            (0, 0, 0, 0),
+            "baseline must have no subagent entries"
+        );
+        for i in 1..=CHURN_SESSIONS {
+            churn_one(&conn, &cwd, i).await;
+        }
+        let conn = &conn;
+        let cwd = &cwd;
+        let concurrent: Vec<acp::SessionId> =
+            futures::future::join_all((0..CONCURRENT_SESSIONS).map(|_| new_session(conn, cwd)))
+                .await;
+        let mid = read_counts(conn).await;
+>>>>>>> b13fa526f5112c0b20dad5f1f2300d3d3b127895
         assert_eq!(
             mid.sessions, CONCURRENT_SESSIONS,
             "the snapshot must observe the open concurrent sessions"
@@ -284,12 +379,20 @@ fn session_churn_returns_registry_snapshot_to_baseline() {
         }))
         .await;
         futures::future::join_all(concurrent.iter().map(|sid| close_session(conn, sid))).await;
+<<<<<<< HEAD
         let after = read_counts(&client_conn).await;
+=======
+        let after = settled_counts(conn).await;
+>>>>>>> b13fa526f5112c0b20dad5f1f2300d3d3b127895
         assert_eq!(
             after, baseline,
             "session churn must return every registry count to baseline \
              (a growing count means a spawn-time map is missing its \
              remove_session release)"
         );
+<<<<<<< HEAD
     }));
+=======
+    });
+>>>>>>> b13fa526f5112c0b20dad5f1f2300d3d3b127895
 }
