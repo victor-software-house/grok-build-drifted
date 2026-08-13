@@ -47,6 +47,13 @@ pub struct UiConfig {
     /// Written by the pager's settings modal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page_flip_on_send: Option<bool>,
+<<<<<<< HEAD
+=======
+    /// Ask before rewinding conversation history. `None` = on (default).
+    /// Written by the pager's settings modal / rewind "Yes, and don't ask again".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm_before_rewind: Option<bool>,
+>>>>>>> e5fd4816d43260c15ba785f103990c1ed6cea230
     /// Theme to use when the OS is in dark mode. Written by the pager's theme persist module.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_dark_theme: Option<String>,
@@ -92,6 +99,11 @@ pub struct UiConfig {
     /// `[voice].language` for the session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice_stt_language: Option<String>,
+    /// Whether the Ctrl+Space / F8 voice-dictation shortcut is active. Written
+    /// by the settings modal; unset defaults to `true` (shortcut on). When
+    /// `false` the chord is ignored — `/voice` still starts dictation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_keybind_enabled: Option<bool>,
     /// When `true`, registers `Ctrl+R` (while scrollback is focused) to toggle
     /// terminal mouse reporting (mouse capture) so users can hand selection back
     /// to the terminal for native click-drag copy/paste. Opt-in only; unset/false
@@ -160,6 +172,9 @@ pub struct UiConfig {
     /// only appears once a user toggles a tip.
     #[serde(default, skip_serializing_if = "ContextualHints::is_default")]
     pub contextual_hints: ContextualHints,
+    /// Combine consecutive queued follow-ups into one turn. `None` = off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub combine_queued_prompts: Option<bool>,
     /// Display-refresh probe + auto-cadence (`[ui.display_refresh]`). Per-field
     /// `None` inherits remote/default; skipped when untouched.
     #[serde(default, skip_serializing_if = "DisplayRefreshSettings::is_default")]
@@ -249,6 +264,10 @@ impl Default for UiConfig {
             show_timestamps: None,
             show_timeline: None,
             page_flip_on_send: None,
+<<<<<<< HEAD
+=======
+            confirm_before_rewind: None,
+>>>>>>> e5fd4816d43260c15ba785f103990c1ed6cea230
             auto_dark_theme: None,
             auto_light_theme: None,
             scroll_speed: None,
@@ -260,6 +279,7 @@ impl Default for UiConfig {
             hunk_tracker_mode: None,
             voice_capture_mode: None,
             voice_stt_language: None,
+            voice_keybind_enabled: None,
             mouse_reporting_toggle: None,
             remember_tool_approvals: None,
             cancel_subagents_on_turn_cancel: None,
@@ -273,6 +293,7 @@ impl Default for UiConfig {
             screen_mode: None,
             double_click_action: None,
             contextual_hints: ContextualHints::default(),
+            combine_queued_prompts: None,
             display_refresh: DisplayRefreshSettings::default(),
         }
     }
@@ -305,6 +326,17 @@ impl UiConfig {
             .unwrap_or(Self::PAGE_FLIP_ON_SEND_DEFAULT)
     }
 
+<<<<<<< HEAD
+=======
+    /// Default for [`Self::confirm_before_rewind`] when unset.
+    pub const CONFIRM_BEFORE_REWIND_DEFAULT: bool = true;
+
+    pub fn confirm_before_rewind_enabled(&self) -> bool {
+        self.confirm_before_rewind
+            .unwrap_or(Self::CONFIRM_BEFORE_REWIND_DEFAULT)
+    }
+
+>>>>>>> e5fd4816d43260c15ba785f103990c1ed6cea230
     /// True when the highlight should not timer-dismiss (`hold` / `word_select`,
     /// or legacy duration 0).
     pub fn keep_text_selection_enabled(&self) -> bool {
@@ -330,6 +362,19 @@ mod tests {
     }
 
     #[test]
+<<<<<<< HEAD
+=======
+    fn confirm_before_rewind_defaults_on() {
+        assert!(UiConfig::default().confirm_before_rewind_enabled());
+        let off = UiConfig {
+            confirm_before_rewind: Some(false),
+            ..Default::default()
+        };
+        assert!(!off.confirm_before_rewind_enabled());
+    }
+
+    #[test]
+>>>>>>> e5fd4816d43260c15ba785f103990c1ed6cea230
     fn keep_text_selection_enabled_precedence() {
         let mut ui = UiConfig::default();
         assert!(!ui.keep_text_selection_enabled());
