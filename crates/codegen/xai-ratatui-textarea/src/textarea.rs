@@ -2073,18 +2073,28 @@ impl TextArea {
             } => {
                 self.move_cursor_down();
             }
-            // Home/End → visual row; Ctrl+A/E → logical line (emacs).
+            // Home/End → logical line (full left/right even when soft-wrapped).
+            // Super+Left/Right stay on the visual wrap row; Ctrl+A/E chain
+            // across logical lines when already at BOL/EOL.
             KeyEvent {
                 code: KeyCode::Home,
                 ..
             } => {
+<<<<<<< HEAD
                 self.move_cursor_to_beginning_of_line(false);
+=======
+                self.set_cursor(self.beginning_of_current_line());
+>>>>>>> eb267feff13129e568df38fb6fdf0ceb65f735d6
             }
 
             KeyEvent {
                 code: KeyCode::End, ..
             } => {
+<<<<<<< HEAD
                 self.move_cursor_to_end_of_line(false);
+=======
+                self.set_cursor(self.end_of_current_line());
+>>>>>>> eb267feff13129e568df38fb6fdf0ceb65f735d6
             }
             _o => {
                 #[cfg(feature = "debug-logs")]
@@ -3534,6 +3544,7 @@ fn truncate_line_display(line: &Line<'static>, max_width: usize) -> Line<'static
 }
 
 #[cfg(test)]
+<<<<<<< HEAD
 mod tests {
     use super::*;
     // crossterm types are intentionally not imported here to avoid unused warnings
@@ -9765,3 +9776,7 @@ mod tests {
         assert_eq!(t.text(), "/");
     }
 }
+=======
+#[path = "textarea_tests.rs"]
+mod tests;
+>>>>>>> eb267feff13129e568df38fb6fdf0ceb65f735d6

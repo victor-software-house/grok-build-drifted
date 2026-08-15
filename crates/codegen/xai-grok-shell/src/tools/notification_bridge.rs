@@ -1,26 +1,28 @@
 //! Notification bridge: translates `xai-grok-tools` `ToolNotification` events
 //! into `xai-grok-shell`'s native systems (ACP gateway, hunk tracker, file state tracker).
-
+use crate::session::commands::SessionCommand;
+use crate::session::commands::{NotificationPriority, NotificationSource};
+use crate::session::persistence::{DurableAppendError, PersistenceHandle, PersistenceMsg};
+use crate::tools::task_completed_frame;
+use agent_client_protocol::{self as acp, Client as _};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-
-use agent_client_protocol::{self as acp, Client as _};
 use tokio::sync::{Mutex as TokioMutex, mpsc};
 use xai_acp_lib::AcpAgentGatewaySender as GatewaySender;
 use xai_grok_tools::notification::types::{ToolNotification, ToolNotificationHandle};
 use xai_grok_tools::types::output::{BashOutput, ToolOutput};
-use xai_hunk_tracker::HunkTrackerHandle;
-
-use crate::session::commands::SessionCommand;
-use crate::session::commands::{NotificationPriority, NotificationSource};
-use crate::session::persistence::PersistenceMsg;
 use xai_grok_workspace::session::file_state::FileStateTracker;
+<<<<<<< HEAD
 
 const TASK_WAKE_ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
+=======
+use xai_hunk_tracker::HunkTrackerHandle;
+const TASK_WAKE_ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+>>>>>>> eb267feff13129e568df38fb6fdf0ceb65f735d6
 /// Configuration for the notification bridge.
-pub struct NotificationBridgeConfig {
+pub(crate) struct NotificationBridgeConfig {
     /// ACP gateway for sending streaming updates to TUI
     pub gateway: GatewaySender,
     /// ACP session ID
@@ -36,9 +38,8 @@ pub struct NotificationBridgeConfig {
     /// Shared gate: when false, suppress gateway forwarding.
     /// Events are still processed for hunk tracking and file state.
     pub gateway_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Persistence channel for durably storing notifications.
-    /// Used to persist bash output even when the gateway gate is closed.
-    pub persistence_tx: mpsc::UnboundedSender<PersistenceMsg>,
+    /// Persistence handle for FIFO ordinary writes and durable tombstone barriers.
+    pub persistence: PersistenceHandle,
     /// When true, send incremental `output_delta` instead of full `output`
     /// in bash streaming updates. The client must opt in via the
     /// `x.ai/incrementalBashOutput` capability.
@@ -97,7 +98,6 @@ pub struct NotificationBridgeConfig {
     /// `SessionActor::set_goal_loop_active_resource` for the rationale.
     pub goal_loop_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
-
 /// Snapshot a shared `OnceLock` tool-name slot as a borrowed `&str`.
 /// Returns `None` if the slot is still unset (toolset not yet finalized)
 /// or if the resolved value is `None` (no such tool registered in this
@@ -105,32 +105,121 @@ pub struct NotificationBridgeConfig {
 pub(crate) fn resolved_tool_name(slot: &std::sync::OnceLock<Option<String>>) -> Option<&str> {
     slot.get().and_then(|v| v.as_deref())
 }
-
 /// Stamp a bridge-emitted notification's meta before it forks into
 /// persistence + broadcast — see `util::event_id::ensure_event_id_meta`.
 fn stamp_event_id(config: &NotificationBridgeConfig, meta: &mut Option<acp::Meta>) {
     crate::util::event_id::ensure_event_id_meta(&config.session_id.0, meta);
 }
-
+fn stamp_scheduler_meta(
+    config: &NotificationBridgeConfig,
+    meta: &mut Option<acp::Meta>,
+    generation: &str,
+    revision: u64,
+) {
+    stamp_event_id(config, meta);
+    let meta = meta.get_or_insert_with(acp::Meta::new);
+    meta.insert("x.ai/schedulerGeneration".to_owned(), generation.into());
+    meta.insert("x.ai/schedulerRevision".to_owned(), revision.into());
+}
+fn durable_append_landed(result: Result<(), DurableAppendError>) -> Result<(), String> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(DurableAppendError::Committed(error)) => {
+            tracing::warn!(%error, "Scheduler tombstone committed with bookkeeping failure");
+            Ok(())
+        }
+        Err(DurableAppendError::NotCommitted(error)) => {
+            Err(format!("scheduler tombstone was not committed: {error}"))
+        }
+        Err(DurableAppendError::AcknowledgementLost(error)) => Err(format!(
+            "scheduler tombstone commit status is unknown: {error}"
+        )),
+    }
+}
+async fn handle_scheduled_task_removed(
+    config: &NotificationBridgeConfig,
+    removed: xai_grok_tools::notification::ScheduledTaskRemoved,
+    acknowledgement: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+) -> Result<(), String> {
+    tracing::info!(task_id = %removed.task_id, "Scheduled task removed");
+    let result: Result<Box<serde_json::value::RawValue>, String> = async {
+        let mut meta = None;
+        stamp_scheduler_meta(config, &mut meta, &removed.generation, removed.revision);
+        let notification = crate::extensions::notification::SessionNotification {
+            session_id: config.session_id.clone(),
+            update: crate::extensions::notification::SessionUpdate::ScheduledTaskDeleted {
+                task_id: removed.task_id,
+                reason: removed.reason,
+            },
+            meta: meta.map(serde_json::Value::Object),
+        };
+        let params = serde_json::to_value(&notification)
+            .and_then(|value| serde_json::value::to_raw_value(&value))
+            .map_err(|error| format!("failed to serialize scheduled task deletion: {error}"))?;
+        let update = crate::session::storage::SessionUpdate::Xai(Box::new(notification));
+        if acknowledgement.is_some() {
+            durable_append_landed(config.persistence.append_update_durably(update).await)?;
+        } else {
+            config
+                .persistence
+                .tx
+                .send(PersistenceMsg::Update(update))
+                .map_err(|_| "session persistence stopped".to_owned())?;
+        }
+        Ok(params)
+    }
+    .await;
+    match result {
+        Ok(params) => {
+            if let Some(acknowledgement) = acknowledgement {
+                let _ = acknowledgement.send(Ok(()));
+            }
+            config
+                .gateway
+                .forward_fire_and_forget(acp::ExtNotification::new(
+                    "x.ai/scheduled_task_deleted",
+                    params.into(),
+                ));
+            Ok(())
+        }
+        Err(error) => {
+            if let Some(acknowledgement) = acknowledgement {
+                let _ = acknowledgement.send(Err(error.clone()));
+            }
+            Err(error)
+        }
+    }
+}
 /// Create a `ToolNotificationHandle` and spawn a bridge task that
 /// translates notifications into shell-native systems.
-pub fn spawn_notification_bridge(config: NotificationBridgeConfig) -> ToolNotificationHandle {
-    let (handle, mut rx) = ToolNotificationHandle::channel();
-
+pub(crate) fn spawn_notification_bridge(
+    config: NotificationBridgeConfig,
+) -> ToolNotificationHandle {
+    let (handle, mut rx) = ToolNotificationHandle::acknowledged_channel();
     tokio::task::spawn_local(async move {
-        // Per-tool-call byte offset for incremental delta computation.
-        // Only used when `config.incremental_bash_output` is true.
         let mut offsets: HashMap<String, usize> = HashMap::new();
-
-        while let Some(notification) = rx.recv().await {
-            handle_notification(&config, notification, &mut offsets).await;
+        while let Some(delivery) = rx.recv().await {
+            let acknowledgement = delivery.acknowledgement;
+            match delivery.notification {
+                ToolNotification::ScheduledTaskRemoved(removed) => {
+                    if let Err(error) =
+                        handle_scheduled_task_removed(&config, removed, acknowledgement).await
+                    {
+                        tracing::warn!(%error, "Failed to handle scheduled task removal");
+                    }
+                }
+                notification => {
+                    handle_notification(&config, notification, &mut offsets).await;
+                    if let Some(acknowledgement) = acknowledgement {
+                        let _ = acknowledgement.send(Ok(()));
+                    }
+                }
+            }
         }
         tracing::debug!("Notification bridge task exiting (sender dropped)");
     });
-
     handle
 }
-
 /// Emit a `CurrentModeUpdate` for the given [`SessionMode`] — persisted to
 /// `updates.jsonl` so session replay re-applies the mode, and forwarded to
 /// the gateway so the pager updates live.
@@ -145,14 +234,11 @@ async fn emit_current_mode_update(
         )),
     );
     stamp_event_id(config, &mut notification.meta);
-
-    let _ = config.persistence_tx.send(PersistenceMsg::Update(
+    let _ = config.persistence.tx.send(PersistenceMsg::Update(
         crate::session::storage::SessionUpdate::Acp(Box::new(notification.clone())),
     ));
-
     config.gateway.forward_fire_and_forget(notification);
 }
-
 /// Handle a single notification by forwarding it to the appropriate shell system.
 async fn handle_notification(
     config: &NotificationBridgeConfig,
@@ -161,25 +247,19 @@ async fn handle_notification(
 ) {
     match notification {
         ToolNotification::BashOutputChunk(chunk) => {
-            // Compute output and output_delta based on incremental mode.
             let (output, output_delta) = if config.incremental_bash_output {
                 let prev_offset = offsets.get(&chunk.base.tool_call_id).copied().unwrap_or(0);
                 let full = &chunk.base.output;
                 let delta = if prev_offset <= full.len() {
                     full[prev_offset..].to_vec()
                 } else {
-                    // Buffer shrank (e.g. terminal clear / reset).
-                    // Send the full buffer and reset offset.
                     full.clone()
                 };
                 offsets.insert(chunk.base.tool_call_id.clone(), full.len());
-                // In incremental mode: output is empty, delta carries the bytes.
                 (Vec::new(), Some(delta))
             } else {
                 (chunk.base.output.clone(), None)
             };
-
-            // Build a ToolOutput::Bash from the chunk for the TUI to parse
             let bash_output = ToolOutput::Bash(BashOutput {
                 output_for_prompt: BashOutput::make_output_for_prompt(&String::from_utf8_lossy(
                     &chunk.base.output,
@@ -197,8 +277,6 @@ async fn handle_notification(
                 output_delta,
                 was_bare_echo: false,
             });
-
-            // Send ACP ToolCallUpdate with InProgress status for TUI streaming
             let update = acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
                 acp::ToolCallId::new(chunk.base.tool_call_id.clone()),
                 acp::ToolCallUpdateFields::new()
@@ -210,14 +288,7 @@ async fn handle_notification(
                     )]))
                     .raw_output(serde_json::to_value(&bash_output).ok()),
             ));
-            let mut notification = acp::SessionNotification::new(config.session_id.clone(), update);
-            stamp_event_id(config, &mut notification.meta);
-            // Always persist — even when the gateway gate is closed, so bash
-            // output survives replay when the client later calls loadSession.
-            let _ = config.persistence_tx.send(PersistenceMsg::Update(
-                crate::session::storage::SessionUpdate::Acp(Box::new(notification.clone())),
-            ));
-            // Only forward to the client if the gateway gate is open.
+            let notification = acp::SessionNotification::new(config.session_id.clone(), update);
             if config
                 .gateway_enabled
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -225,9 +296,7 @@ async fn handle_notification(
                 let _ = config.gateway.session_notification(notification).await;
             }
         }
-
         ToolNotification::BashExecutionComplete(complete) => {
-            // Clean up offset tracking for this tool call.
             offsets.remove(&complete.base.tool_call_id);
             tracing::debug!(
                 tool_call_id = %complete.base.tool_call_id,
@@ -235,7 +304,6 @@ async fn handle_notification(
                 "Bash execution complete notification received"
             );
         }
-
         ToolNotification::BashExecutionTimeout(timeout) => {
             tracing::debug!(
                 tool_call_id = %timeout.base.tool_call_id,
@@ -243,7 +311,6 @@ async fn handle_notification(
                 "Bash execution timeout notification received"
             );
         }
-
         ToolNotification::BashExecutionFailed(failed) => {
             tracing::warn!(
                 tool_call_id = %failed.tool_call_id,
@@ -251,7 +318,6 @@ async fn handle_notification(
                 "Bash execution failed notification received"
             );
         }
-
         ToolNotification::BashExecutionBackgrounded(bg) => {
             tracing::debug!(
                 tool_call_id = %bg.base.tool_call_id,
@@ -260,9 +326,6 @@ async fn handle_notification(
                 output_file = %bg.output_file.display(),
                 "Bash execution backgrounded notification received — forwarding to TUI"
             );
-
-            // Forward as x.ai/task_backgrounded ExtNotification so the TUI can
-            // correlate tool_call_id with task_id and populate the tasks panel.
             let mut notification = crate::extensions::notification::SessionNotification {
                 session_id: config.session_id.clone(),
                 update: crate::extensions::notification::SessionUpdate::TaskBackgrounded {
@@ -281,12 +344,9 @@ async fn handle_notification(
                 stamp_event_id(config, &mut meta_map);
                 notification.meta = meta_map.map(serde_json::Value::Object);
             }
-
-            // Persist so task correlation survives reconnect/replay.
-            let _ = config.persistence_tx.send(PersistenceMsg::Update(
+            let _ = config.persistence.tx.send(PersistenceMsg::Update(
                 crate::session::storage::SessionUpdate::Xai(Box::new(notification.clone())),
             ));
-
             let params = serde_json::to_value(&notification)
                 .and_then(|v| serde_json::value::to_raw_value(&v))
                 .ok();
@@ -296,7 +356,6 @@ async fn handle_notification(
                 config.gateway.forward_fire_and_forget(ext_notification);
             }
         }
-
         ToolNotification::FileWritten(written) => {
             let prompt_index = *config.prompt_index.lock().await;
             config.hunk_tracker_handle.record_agent_write(
@@ -305,7 +364,6 @@ async fn handle_notification(
                 prompt_index,
                 written.previous_content.clone(),
             );
-
             if written.previous_content.is_some() || written.is_new_file {
                 config
                     .file_state_tracker
@@ -317,14 +375,13 @@ async fn handle_notification(
                     )
                     .await;
             }
-
             tracing::debug!(
                 path = %written.absolute_path.display(),
                 is_new_file = written.is_new_file,
                 "FileWritten notification forwarded to hunk tracker"
             );
         }
-
+        ToolNotification::SubagentCompleted(_) => {}
         ToolNotification::TaskCompleted(task_snapshot) => {
             let is_monitor =
                 task_snapshot.kind == xai_grok_tools::computer::types::TaskKind::Monitor;
@@ -332,16 +389,28 @@ async fn handle_notification(
             let goal_loop_active = config
                 .goal_loop_active
                 .load(std::sync::atomic::Ordering::Relaxed);
+<<<<<<< HEAD
 
             // Natural monitor exit uses the same immediate wake path as bash;
             // x.ai/task_completed still drives the pager UI in every branch.
             let mut will_wake = false;
             if task_snapshot.block_waited || task_snapshot.explicitly_killed {
                 // The blocking wait or kill result already reports completion.
+=======
+            let mut will_wake = false;
+            if task_snapshot.is_auto_wake_suppressed() {
+                xai_grok_telemetry::unified_log::info(
+                    "shell.task_wake.suppressed",
+                    Some(config.session_id.0.as_ref()),
+                    Some(serde_json::json!({
+                        "task_id": &task_id,
+                        "block_waited": task_snapshot.block_waited,
+                        "explicitly_killed": task_snapshot.explicitly_killed,
+                        "kill_result_delivered": task_snapshot.kill_result_delivered,
+                    })),
+                );
+>>>>>>> eb267feff13129e568df38fb6fdf0ceb65f735d6
             } else if goal_loop_active {
-                // Goal loop active: suppress the wake (synthetic prompt + the
-                // idle-gated fallback); surfaces 2/3 drain it. See
-                // `set_goal_loop_active_resource`.
                 tracing::info!(
                     task_id = %task_id,
                     is_monitor,
@@ -349,7 +418,10 @@ async fn handle_notification(
                 );
             } else if config.auto_wake_enabled {
                 config.task_completion_reservations.reserve(task_id.clone());
+<<<<<<< HEAD
 
+=======
+>>>>>>> eb267feff13129e568df38fb6fdf0ceb65f735d6
                 let tool_name = resolved_tool_name(&config.task_output_tool_name);
                 let read_name = resolved_tool_name(&config.read_tool_name);
                 let body = if is_monitor {
@@ -367,7 +439,10 @@ async fn handle_notification(
                 let message = xai_grok_tools::reminders::wrap_reminder(&body);
                 let prompt_id = format!("task-completed-{task_id}");
                 let prompt_blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(message))];
+<<<<<<< HEAD
 
+=======
+>>>>>>> eb267feff13129e568df38fb6fdf0ceb65f735d6
                 let synthetic_trace_tx = config
                     .synthetic_trace_tx
                     .lock()
@@ -394,6 +469,10 @@ async fn handle_notification(
                         traceparent: xai_file_utils::trace_context::current_traceparent(),
                         json_schema: None,
                         send_now: false,
+<<<<<<< HEAD
+=======
+                        tool_overrides_update: None,
+>>>>>>> eb267feff13129e568df38fb6fdf0ceb65f735d6
                         admission: Some(crate::session::commands::TaskWakeAdmission {
                             respond_to: admission_tx,
                             fallback: crate::session::commands::TaskWakeFallback {
@@ -445,7 +524,10 @@ async fn handle_notification(
                         "gate": config.task_wake_suppressed.get(),
                     })),
                 );
+<<<<<<< HEAD
 
+=======
+>>>>>>> eb267feff13129e568df38fb6fdf0ceb65f735d6
                 if will_wake {
                     if is_monitor {
                         let _ =
@@ -489,7 +571,6 @@ async fn handle_notification(
                     }
                 }
             } else {
-                // Auto-wake disabled — fall back to idle-gated notification drain.
                 let tool_name = resolved_tool_name(&config.task_output_tool_name);
                 let read_name = resolved_tool_name(&config.read_tool_name);
                 let message = if is_monitor {
@@ -528,8 +609,6 @@ async fn handle_notification(
                         source,
                     });
             }
-
-            // When a task is complete send notifications to the client so it can act on it
             let mut notification = crate::extensions::notification::SessionNotification {
                 session_id: config.session_id.clone(),
                 update: crate::extensions::notification::SessionUpdate::TaskCompleted {
@@ -543,21 +622,16 @@ async fn handle_notification(
                 stamp_event_id(config, &mut meta_map);
                 notification.meta = meta_map.map(serde_json::Value::Object);
             }
-
-            // Persist so task completion history survives reconnect/replay.
-            let _ = config.persistence_tx.send(PersistenceMsg::Update(
-                crate::session::storage::SessionUpdate::Xai(Box::new(notification.clone())),
-            ));
-
-            let params = serde_json::to_value(&notification)
-                .and_then(|v| serde_json::value::to_raw_value(&v))
-                .ok();
-            if let Some(params) = params {
-                let notification: acp::ExtNotification =
-                    acp::ExtNotification::new("x.ai/task_completed", params.into());
+            if let Some(params) = task_completed_frame::encode(&mut notification) {
+                let _ = config.persistence.tx.send(PersistenceMsg::Update(
+                    crate::session::storage::SessionUpdate::Xai(Box::new(notification.clone())),
+                ));
+                let notification: acp::ExtNotification = acp::ExtNotification::new(
+                    task_completed_frame::METHOD,
+                    params.into_inner().into(),
+                );
                 config.gateway.forward_fire_and_forget(notification);
             }
-
             let _ = config
                 .session_cmd_tx
                 .send(SessionCommand::DispatchNotificationHook {
@@ -567,21 +641,16 @@ async fn handle_notification(
                     level: Some("info".into()),
                 });
         }
-
         ToolNotification::PlanModeEntered(entered) => {
             let activated = config.plan_mode.lock().activate_from_tool();
             if activated {
                 *config.current_prompt_mode.lock() = crate::session::plan_mode::PromptMode::Plan;
                 *config.turn_prompt_mode.lock() = crate::session::plan_mode::PromptMode::Plan;
-
                 let snapshot = config.plan_mode.lock().snapshot();
                 let _ = config
-                    .persistence_tx
+                    .persistence
+                    .tx
                     .send(PersistenceMsg::PlanModeState(snapshot));
-
-                // Notify the frontend immediately so the plan-mode chip appears in the UI
-                // (currentModeId = 'plan'). Without this the agent can silently enter plan
-                // mode via the EnterPlanMode tool and the UI would never update.
                 emit_current_mode_update(config, xai_grok_tools::types::SessionMode::Plan).await;
             }
             tracing::info!(
@@ -590,10 +659,7 @@ async fn handle_notification(
                 "Plan mode entered via EnterPlanMode tool"
             );
         }
-
         ToolNotification::PlanModeExited(exited) => {
-            // v1: auto-approve. A full implementation would present an
-            // approval UI with reject/feedback options.
             let deactivated = {
                 let mut tracker = config.plan_mode.lock();
                 let deactivated = tracker.deactivate_approved();
@@ -609,16 +675,11 @@ async fn handle_notification(
             if deactivated {
                 *config.current_prompt_mode.lock() = crate::session::plan_mode::PromptMode::Agent;
                 *config.turn_prompt_mode.lock() = crate::session::plan_mode::PromptMode::Agent;
-
                 let snapshot = config.plan_mode.lock().snapshot();
                 let _ = config
-                    .persistence_tx
+                    .persistence
+                    .tx
                     .send(PersistenceMsg::PlanModeState(snapshot));
-
-                // Mirror the entry path: emit a `CurrentModeUpdate("default")`
-                // so the pager flips out of plan mode without having to
-                // string-match tool titles. Persist + forward so the next
-                // session replay also sees the exit.
                 emit_current_mode_update(config, xai_grok_tools::types::SessionMode::Default).await;
             }
             tracing::info!(
@@ -628,14 +689,12 @@ async fn handle_notification(
                 "Plan mode exited via ExitPlanMode tool"
             );
         }
-
         ToolNotification::UserQuestionAsked(asked) => {
             tracing::info!(
                 tool_call_id = %asked.tool_call_id,
                 "User question asked"
             );
         }
-
         ToolNotification::LspServerStarting(s) => {
             tracing::debug!(server = %s.server_name, command = %s.command, "LSP server starting");
         }
@@ -657,30 +716,32 @@ async fn handle_notification(
         ToolNotification::LspServerFailed(s) => {
             tracing::error!(server = %s.server_name, error = %s.error, "LSP server failed");
         }
-
         ToolNotification::ScheduledTaskFired(fired) => {
             tracing::info!(
                 task_id = %fired.task_id,
                 schedule = %fired.human_schedule,
-                "Scheduled task fired, injecting prompt into session"
+                subagent_id = fired.subagent_id.as_deref().unwrap_or(""),
+                "Scheduled task fired"
             );
-
-            let inject_payload = serde_json::json!({
-                "sessionId": config.session_id,
-                "taskId": &fired.task_id,
-                "prompt": &fired.prompt,
-                "humanSchedule": &fired.human_schedule,
-                "nextFireAt": &fired.next_fire_at,
-            });
-            if let Ok(params) = serde_json::value::to_raw_value(&inject_payload) {
-                config
-                    .gateway
-                    .forward_fire_and_forget(acp::ExtNotification::new(
-                        "x.ai/scheduled_task_inject_prompt",
-                        params.into(),
-                    ));
+            if fired.subagent_id.is_none() {
+                let inject_payload = serde_json::json!({
+                    "sessionId": config.session_id,
+                    "taskId": &fired.task_id,
+                    "prompt": &fired.prompt,
+                    "humanSchedule": &fired.human_schedule,
+                    "nextFireAt": &fired.next_fire_at,
+                });
+                if let Ok(params) = serde_json::value::to_raw_value(&inject_payload) {
+                    config
+                        .gateway
+                        .forward_fire_and_forget(acp::ExtNotification::new(
+                            "x.ai/scheduled_task_inject_prompt",
+                            params.into(),
+                        ));
+                }
             }
-
+            let mut meta = None;
+            stamp_scheduler_meta(config, &mut meta, &fired.generation, fired.revision);
             let fired_notif = crate::extensions::notification::SessionNotification {
                 session_id: config.session_id.clone(),
                 update: crate::extensions::notification::SessionUpdate::ScheduledTaskFired {
@@ -688,8 +749,9 @@ async fn handle_notification(
                     prompt: fired.prompt,
                     human_schedule: fired.human_schedule,
                     next_fire_at: fired.next_fire_at,
+                    subagent_id: fired.subagent_id,
                 },
-                meta: None,
+                meta: meta.map(serde_json::Value::Object),
             };
             if let Ok(params) =
                 serde_json::to_value(&fired_notif).and_then(|v| serde_json::value::to_raw_value(&v))
@@ -702,17 +764,11 @@ async fn handle_notification(
                     ));
             }
         }
-
         ToolNotification::MonitorEvent(event) => {
-            // Cross-session guard: in leader mode many sessions share one agent
-            // process, so drop events whose owner isn't this bridge's session
-            // (else session A's monitor injects reminders into session B).
-            // `None` owners (legacy backends) pass through.
             let my_session = config.session_id.0.as_ref();
             if let Some(owner) = event.owner_session_id.as_deref()
                 && owner != my_session
             {
-                // WARN (not debug) to surface the leader-mode mis-route in logs.
                 tracing::warn!(
                     task_id = %event.task_id,
                     description = %event.description,
@@ -722,14 +778,11 @@ async fn handle_notification(
                 );
                 return;
             }
-
             tracing::debug!(
                 task_id = %event.task_id,
                 description = %event.description,
                 "Monitor event received, injecting into session"
             );
-
-            // Forward to pager -- raw text for the bg task stdout buffer.
             let notification = crate::extensions::notification::SessionNotification {
                 session_id: config.session_id.clone(),
                 update: crate::extensions::notification::SessionUpdate::MonitorEvent {
@@ -750,10 +803,13 @@ async fn handle_notification(
                         params.into(),
                     ));
             }
+<<<<<<< HEAD
 
             // If this monitor already auto-woke via TaskCompleted, do not inject
             // model-facing notifications (avoids a second NotificationDrain turn
             // with the same ended signal). Pager UI still got the event above.
+=======
+>>>>>>> eb267feff13129e568df38fb6fdf0ceb65f735d6
             if config.task_completion_reservations.contains(&event.task_id) {
                 tracing::debug!(
                     task_id = %event.task_id,
@@ -761,8 +817,6 @@ async fn handle_notification(
                 );
                 return;
             }
-
-            // Inject the event into the notification queue for idle-gated drain.
             let prompt_id = format!("monitor-{}-{}", event.task_id, uuid::Uuid::now_v7());
             let prompt_blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(
                 event.event_text,
@@ -778,43 +832,16 @@ async fn handle_notification(
                     },
                 });
         }
-
         ToolNotification::ScheduledTaskRemoved(removed) => {
-            tracing::info!(task_id = %removed.task_id, "Scheduled task removed");
-
-            let mut notification = crate::extensions::notification::SessionNotification {
-                session_id: config.session_id.clone(),
-                update: crate::extensions::notification::SessionUpdate::ScheduledTaskDeleted {
-                    task_id: removed.task_id,
-                },
-                meta: None,
-            };
-            {
-                let mut meta_map = None;
-                stamp_event_id(config, &mut meta_map);
-                notification.meta = meta_map.map(serde_json::Value::Object);
-            }
-            // Persist the deletion too, so replay on resume nets out a removed
-            // loop instead of resurrecting it from a persisted `created` line.
-            let _ = config.persistence_tx.send(PersistenceMsg::Update(
-                crate::session::storage::SessionUpdate::Xai(Box::new(notification.clone())),
-            ));
-            if let Ok(params) = serde_json::to_value(&notification)
-                .and_then(|v| serde_json::value::to_raw_value(&v))
-            {
-                config
-                    .gateway
-                    .forward_fire_and_forget(acp::ExtNotification::new(
-                        "x.ai/scheduled_task_deleted",
-                        params.into(),
-                    ));
+            if let Err(error) = handle_scheduled_task_removed(config, removed, None).await {
+                tracing::warn!(%error, "Failed to handle scheduled task removal");
             }
         }
-
         ToolNotification::ScheduledTaskCreated(created) => {
             tracing::info!(task_id = %created.task_id, "Scheduled task created");
-
-            let mut notification = crate::extensions::notification::SessionNotification {
+            let mut meta = None;
+            stamp_scheduler_meta(config, &mut meta, &created.generation, created.revision);
+            let notification = crate::extensions::notification::SessionNotification {
                 session_id: config.session_id.clone(),
                 update: crate::extensions::notification::SessionUpdate::ScheduledTaskCreated {
                     task_id: created.task_id,
@@ -822,22 +849,9 @@ async fn handle_notification(
                     human_schedule: created.human_schedule,
                     next_fire_at: created.next_fire_at,
                 },
-                meta: None,
+                meta: meta.map(serde_json::Value::Object),
             };
-            {
-                let mut meta_map = None;
-                stamp_event_id(config, &mut meta_map);
-                notification.meta = meta_map.map(serde_json::Value::Object);
-            }
-            // Persist so the loop survives reconnect/replay, mirroring
-            // TaskBackgrounded/TaskCompleted. Without this, a second terminal
-            // that resumes the session restores monitors and subagents (whose
-            // notifications are persisted) but NOT loops, so the "watching" cue
-            // and Tasks pane undercount until the loop next fires. Create/delete
-            // are infrequent (bounded by the number of live loops); the
-            // recurring `_fired` notification is deliberately NOT persisted to
-            // avoid unbounded log growth.
-            let _ = config.persistence_tx.send(PersistenceMsg::Update(
+            let _ = config.persistence.tx.send(PersistenceMsg::Update(
                 crate::session::storage::SessionUpdate::Xai(Box::new(notification.clone())),
             ));
             if let Ok(params) = serde_json::to_value(&notification)
@@ -853,8 +867,8 @@ async fn handle_notification(
         }
     }
 }
-
 #[cfg(test)]
+<<<<<<< HEAD
 mod tests {
     use super::*;
     use xai_grok_tools::computer::types::TaskKind;
@@ -2427,3 +2441,7 @@ mod tests {
         );
     }
 }
+=======
+#[path = "notification_bridge_tests.rs"]
+mod tests;
+>>>>>>> eb267feff13129e568df38fb6fdf0ceb65f735d6
