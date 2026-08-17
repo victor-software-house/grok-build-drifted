@@ -38,6 +38,7 @@ fn detector_entry(
         info,
         api_key: None,
         env_key: None,
+        auth_provider: None,
         api_base_url: None,
     }
 }
@@ -335,12 +336,19 @@ async fn idle_recheck_after_sleep_short_circuits_silently() {
                         screen_mode: None,
                         verbatim: true,
                         json_schema: None,
+<<<<<<< HEAD
                         origin: crate::session::PromptOrigin::User,
                         task_wake_fallback: None,
+=======
+                        input_origin: InputOrigin::new(crate::session::PromptOrigin::User),
+                        task_wake_fallback: None,
+                        tool_overrides_update: None,
+>>>>>>> 9fabadea800fa6e2ed8ec91c4f45f02b7e2504f4
                         respond_to,
                         persist_ack: None,
                         parsed_prompt_tx: None,
                         queue_meta: None,
+                        queue_mutation_policy: QueueMutationPolicy::hidden(),
                         send_now: false,
                     });
             });
