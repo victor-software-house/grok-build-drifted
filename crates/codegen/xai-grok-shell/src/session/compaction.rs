@@ -9,14 +9,15 @@ use super::SessionActor;
 use super::is_project_instructions;
 use crate::remote::DEFAULT_CONTEXT_WINDOW;
 use crate::session::compaction_config::{
-    AsyncCompactionCache, SUPPRESS_NONE, SUPPRESS_STICKY, SUPPRESS_TURN, SUPPRESS_UNTIL_SUCCESS,
+    AsyncCompactionCache, SUPPRESS_AUTH, SUPPRESS_NONE, SUPPRESS_STICKY, SUPPRESS_TURN,
+    SUPPRESS_UNTIL_SUCCESS,
 };
 use crate::session::helpers::CompactionStateContext;
 use crate::session::helpers::compaction_context::CompactionInputs;
 use crate::session::helpers::compaction_context::to_system_reminder;
 use crate::session::helpers::session_compact::{
-    CompactOutput, CompactionOutcome, build_compaction_chat_history,
-    build_two_pass_compaction_prompt, generate_session_compact, is_context_length_error,
+    CompactOutput, CompactionOutcome, build_two_pass_compaction_prompt, generate_session_compact,
+    is_context_length_error,
 };
 use crate::session::persistence::PersistenceMsg;
 use crate::session::two_pass::{
@@ -112,49 +113,8 @@ impl From<PrefireOutcome> for PrefirePass1Run {
     }
 }
 #[cfg(test)]
-mod two_pass_prefire_helper_tests {
-    use super::{fingerprint_prefix, prefire_lead_percent};
-    use xai_grok_sampling_types::ConversationItem;
-    #[test]
-    fn fingerprint_stable_for_same_prefix() {
-        let items = vec![
-            ConversationItem::system("sys"),
-            ConversationItem::user("hello"),
-            ConversationItem::assistant("hi"),
-        ];
-        assert_eq!(fingerprint_prefix(&items), fingerprint_prefix(&items));
-    }
-    #[test]
-    fn fingerprint_changes_when_prefix_content_changes() {
-        let base = vec![
-            ConversationItem::system("sys"),
-            ConversationItem::user("hello"),
-        ];
-        let edited = vec![
-            ConversationItem::system("sys"),
-            ConversationItem::user("HELLO there"),
-        ];
-        assert_ne!(
-            fingerprint_prefix(&base),
-            fingerprint_prefix(&edited),
-            "a changed prefix must invalidate the cached NOTE1 fingerprint"
-        );
-    }
-    #[test]
-    fn fingerprint_changes_with_length() {
-        let short = vec![ConversationItem::user("a")];
-        let long = vec![
-            ConversationItem::user("a"),
-            ConversationItem::assistant("b"),
-        ];
-        assert_ne!(fingerprint_prefix(&short), fingerprint_prefix(&long));
-    }
-    #[test]
-    fn prefire_lead_percent_defaults_to_10() {
-        unsafe { std::env::remove_var("GROK_PREFIRE_LEAD_PERCENT") };
-        assert_eq!(prefire_lead_percent(), 10);
-    }
-}
+#[path = "compaction_two_pass_prefire_helper_tests.rs"]
+mod two_pass_prefire_helper_tests;
 impl SessionActor {
     /// Two-pass active for this session: flag resolved on at build AND not an
     /// agent that keeps its single short self-summary.
@@ -176,29 +136,23 @@ impl SessionActor {
         let client = match self.prepare_chat_completion(false).await {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!(
-                    error = % e, "two_pass: failed to prepare sampling client"
-                );
+                tracing::warn!(error = %e, "two_pass: failed to prepare sampling client");
                 return None;
             }
         };
         let tool_defs = self.prepare_tool_definitions().await;
         let tools = self.turn_base_tool_specs(&tool_defs);
-        let (hosted_tools, wall_clock_budget_secs) = {
-            let agent = self.agent.borrow();
-            let use_backend_search =
-                agent.backend_search_enabled() && self.supports_backend_search.get();
-            (
-                if use_backend_search {
-                    agent.hosted_tools().to_vec()
-                } else {
-                    Vec::new()
-                },
-                agent.compaction_policy().wall_clock_budget_secs,
-            )
-        };
+        let compaction_tool_tokens = xai_chat_state::estimate_tool_specs_tokens(&tools);
+        let wall_clock_budget_secs = self
+            .agent
+            .borrow()
+            .compaction_policy()
+            .wall_clock_budget_secs;
+        let hosted_tools = self.hosted_tools_for_turn();
+        let (cancel, _cancel_scope) = self.compaction.cancel.enter();
         match generate_session_compact(
             history,
+            compaction_tool_tokens,
             tools,
             hosted_tools,
             client,
@@ -207,12 +161,16 @@ impl SessionActor {
             self.inference_idle_timeout,
             wall_clock_budget_secs,
             self.compaction.tool_choice,
+<<<<<<< HEAD
+=======
+            &cancel,
+>>>>>>> d92c5b0b8582fda358de1f97446aa74af44a464f
         )
         .await
         {
             Ok(out) => Some(out),
             Err(e) => {
-                tracing::warn!(error = ? e, "two_pass: summarization sample failed");
+                tracing::warn!(error = ?e, "two_pass: summarization sample failed");
                 None
             }
         }
@@ -278,7 +236,7 @@ impl SessionActor {
             .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
         {
             tracing::info!(
-                target : "two_pass",
+                target: "two_pass",
                 "two_pass: DEBUG GROK_DEBUG_TWO_PASS_FAIL_PASS1 — prefire pass1 produces no cache"
             );
             return PrefireOutcome::DebugFailPass1.into();
@@ -334,8 +292,10 @@ impl SessionActor {
             pass1_latency_ms,
         };
         tracing::info!(
-            target : "two_pass", prefix_len = cache.prefix_len, pass1_latency_ms = cache
-            .pass1_latency_ms, "two_pass: prefire pass1 cached NOTE1"
+            target: "two_pass",
+            prefix_len = cache.prefix_len,
+            pass1_latency_ms = cache.pass1_latency_ms,
+            "two_pass: prefire pass1 cached NOTE1"
         );
         self.compaction.prefire.store(cache);
         attempted(PrefireOutcome::Cached, Some(note1_chars))
@@ -372,7 +332,8 @@ impl SessionActor {
                 tracing::Span::current()
                     .record("compaction_prefire_waited_ms", prefire_waited_ms as i64);
                 tracing::info!(
-                    target : "two_pass", wait_ms = prefire_waited_ms,
+                    target: "two_pass",
+                    wait_ms = prefire_waited_ms,
                     "two_pass: waited for in-flight prefire pass1 before pass2"
                 );
             }
@@ -392,7 +353,7 @@ impl SessionActor {
         {
             tracing::Span::current().record("compaction_prefire_stale", true);
             tracing::info!(
-                target : "two_pass",
+                target: "two_pass",
                 "two_pass: cached NOTE1 stale or model changed; falling back to single-pass"
             );
             return None;
@@ -409,7 +370,7 @@ impl SessionActor {
         if is_degenerate_summary(&out.content) {
             tracing::Span::current().record("compaction_prefire_stale", true);
             tracing::info!(
-                target : "two_pass",
+                target: "two_pass",
                 "two_pass: pass2 summary empty/degenerate; falling back to single-pass"
             );
             return None;
@@ -423,9 +384,13 @@ impl SessionActor {
         span.record("compaction_prefire_hit", true);
         span.record("compaction_pass2_latency_ms", pass2_latency_ms as i64);
         tracing::info!(
-            target : "two_pass", prefix_len = cache.prefix_len, tail_len = tail.len(),
-            prefire_waited_ms, pass2_latency_ms, pass1_bg_latency_ms = cache
-            .pass1_latency_ms, "two_pass: pass2 applied cached NOTE1 (prefire hit)"
+            target: "two_pass",
+            prefix_len = cache.prefix_len,
+            tail_len = tail.len(),
+            prefire_waited_ms,
+            pass2_latency_ms,
+            pass1_bg_latency_ms = cache.pass1_latency_ms,
+            "two_pass: pass2 applied cached NOTE1 (prefire hit)"
         );
         Some(out)
     }
@@ -458,16 +423,15 @@ impl SuppressReason {
         }
     }
     /// Suppression scope for this reason:
-    /// - `size | schema` → [`SUPPRESS_STICKY`]: retrying the same conversation
-    ///   can't help; cleared only on a context-budget change.
-    /// - `credit_block | auth` → [`SUPPRESS_UNTIL_SUCCESS`]: re-sending fails the
-    ///   same way every turn until the user acts, so don't clear per-turn — wait
-    ///   for an actual successful model call (a `200` proves recovery).
+    /// - `size | schema` → [`SUPPRESS_STICKY`]: cleared only on a context-budget change.
+    /// - `credit_block` → [`SUPPRESS_UNTIL_SUCCESS`]: wait for a model `200`.
+    /// - `auth` → [`SUPPRESS_AUTH`]: clear on login/token refresh (not 200 — over-window deadlock).
     /// - `other` → [`SUPPRESS_TURN`]: optimistic per-turn retry.
     fn suppress_state(self) -> u8 {
         match self {
             SuppressReason::Size | SuppressReason::Schema => SUPPRESS_STICKY,
-            SuppressReason::CreditBlock | SuppressReason::Auth => SUPPRESS_UNTIL_SUCCESS,
+            SuppressReason::CreditBlock => SUPPRESS_UNTIL_SUCCESS,
+            SuppressReason::Auth => SUPPRESS_AUTH,
             SuppressReason::Other => SUPPRESS_TURN,
         }
     }
@@ -551,7 +515,7 @@ impl SessionActor {
             .memory
             .last_flush_compaction
             .load(std::sync::atomic::Ordering::Relaxed);
-        if crate::session::helpers::memory_flush::should_flush(
+        if xai_grok_memory::flush::should_flush(
             total_tokens,
             context_window,
             self.compaction.threshold_percent.get(),
@@ -603,6 +567,7 @@ impl SessionActor {
         self: &Arc<Self>,
         user_context: Option<String>,
     ) -> Result<(), acp::Error> {
+        let (_cancel, _cancel_scope) = self.compaction.cancel.enter();
         self.record_compaction_variant();
         let total_tokens = self.chat_state_handle.get_total_tokens().await;
         tracing::Span::current().record("pre_tokens", total_tokens as i64);
@@ -640,11 +605,20 @@ impl SessionActor {
         .await;
         Ok(())
     }
-    /// Suppress AUTO compaction after a deterministic failure so the gates stop
-    /// re-firing a doomed compaction. Scope depends on the reason (see
-    /// [`SuppressReason::suppress_state`]): size/schema are sticky, credit/auth
-    /// hold until a model call succeeds, other clears next turn. Fires telemetry +
-    /// one notification per transition; manual `/compact` is exempt.
+    async fn emit_compact_cancelled(&self, auto_trigger: bool) -> Result<(), acp::Error> {
+        if auto_trigger {
+            use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
+            self.send_xai_notification(XaiSessionUpdate::AutoCompactCancelled {
+                reason: crate::extensions::notification::AutoCompactCancelReason::UserCancelled,
+            })
+            .await;
+        }
+        Err(crate::session::helpers::session_compact::CompactFailure::cancelled_error())
+    }
+    /// Suppress AUTO compaction after a deterministic failure. Scope depends on
+    /// the reason (see [`SuppressReason::suppress_state`]): size/schema sticky,
+    /// credit until 200, auth until credentials recover, other clears next turn.
+    /// Telemetry + one notification per transition; manual `/compact` exempt.
     async fn suppress_auto_compaction(
         &self,
         reason: SuppressReason,
@@ -718,6 +692,81 @@ impl SessionActor {
             SuppressReason::Other
         }
     }
+    /// ACP error payload string (plain string or `{message, ...}`).
+    fn acp_error_message(err: &acp::Error) -> String {
+        match err.data.as_ref() {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(obj) => obj
+                .get("message")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+                .unwrap_or_else(|| obj.to_string()),
+            None => err.message.clone(),
+        }
+    }
+    /// Auth/401 compact failure — abort for reauth resubmit; don't sample oversized.
+    pub(crate) fn is_auth_compact_error(err: &acp::Error) -> bool {
+        matches!(
+            Self::classify_suppress_reason(&Self::acp_error_message(err)),
+            SuppressReason::Auth
+        )
+    }
+    /// Terminal auth compact failure: emit RetryState auth (reauth stash) + auth_required.
+    /// Separate from `AutoCompactFailed` (user-facing); this aborts the turn.
+    pub(crate) async fn surface_compact_auth_failure(&self, err: acp::Error) -> acp::Error {
+        use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
+        let detailed = Self::acp_error_message(&err);
+        let message = if detailed.to_ascii_lowercase().contains("unauthorized") {
+            detailed
+        } else {
+            format!(
+                "Unauthorized (401): compaction failed — re-authenticate with /login \
+                 and retry. ({detailed})"
+            )
+        };
+        tracing::warn!(
+            session_id = %self.session_info.id.0,
+            error = %message,
+            "auto-compact auth failure: aborting turn for re-auth"
+        );
+        xai_grok_telemetry::unified_log::warn(
+            "auto-compact auth failure: aborting turn for re-auth",
+            Some(self.session_info.id.0.as_ref()),
+            Some(serde_json::json!({
+                "message": crate::util::truncate(&message, 300),
+            })),
+        );
+        self.send_xai_notification(XaiSessionUpdate::RetryState(
+            crate::extensions::notification::RetryState::Failed {
+                error_type: "auth".to_string(),
+                message: message.clone(),
+            },
+        ))
+        .await;
+        acp::Error::auth_required().data(crate::sampling::error::terminal_error_data(
+            message,
+            Some(401),
+            xai_grok_sampler::SamplingErrorKind::Auth,
+        ))
+    }
+    /// Clear [`SUPPRESS_AUTH`] on login/token refresh (credit suppress waits for a 200).
+    pub(crate) fn clear_auth_compact_suppression(&self) {
+        let _ = self.compaction.auto_compact_suppressed.compare_exchange(
+            SUPPRESS_AUTH,
+            SUPPRESS_NONE,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    /// Credit or auth suppress — a model switch cannot clear these.
+    fn is_account_state_suppressed(&self) -> bool {
+        matches!(
+            self.compaction
+                .auto_compact_suppressed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            SUPPRESS_UNTIL_SUCCESS | SUPPRESS_AUTH
+        )
+    }
     /// Choose the post-compaction history for a forked session: re-pin the inherited
     /// prefix, or release it (fall back to the self-contained summary the summarizer
     /// already built from the whole conversation) when re-pinning would leave the fork
@@ -754,14 +803,17 @@ impl SessionActor {
                         .store(true, std::sync::atomic::Ordering::Relaxed);
                     tracing::Span::current().record("compaction_prefix_released", true);
                     tracing::info!(
-                        session_id = % self.session_info.id.0, prefix_len,
+                        session_id = %self.session_info.id.0,
+                        prefix_len,
                         projected_preserved,
                         "compaction: releasing inherited prefix under pressure"
                     );
                     release_candidate
                 } else {
                     tracing::info!(
-                        session_id = % self.session_info.id.0, prefix_len, compacted_len,
+                        session_id = %self.session_info.id.0,
+                        prefix_len,
+                        compacted_len,
                         "Preserving inherited prefix across compaction"
                     );
                     preserved
@@ -769,8 +821,9 @@ impl SessionActor {
             }
             Err(original) => {
                 tracing::warn!(
-                    session_id = % self.session_info.id.0, prefix_len, conversation_len =
-                    full_conv.len(),
+                    session_id = %self.session_info.id.0,
+                    prefix_len,
+                    conversation_len = full_conv.len(),
                     "Inherited prefix invalid, using compacted history as-is"
                 );
                 original
@@ -815,6 +868,7 @@ impl SessionActor {
         auto_continue: Option<crate::extensions::notification::AutoContinueInfo>,
         trigger: xai_grok_telemetry::events::CompactionTrigger,
     ) -> Result<(), acp::Error> {
+        let (cancel, _cancel_scope) = self.compaction.cancel.enter();
         let tokens_before = self.chat_state_handle.get_total_tokens().await;
         tracing::Span::current().record("compaction_tokens_before", tokens_before as i64);
         self.signals_handle().record_compaction(tokens_before);
@@ -891,7 +945,7 @@ impl SessionActor {
         };
         if conv_len == 0 {
             tracing::error!(
-                session_id = % self.session_info.id.0,
+                session_id = %self.session_info.id.0,
                 "Compaction failed: conversation is empty (ChatStateActor may have died)"
             );
             return Err(
@@ -902,7 +956,8 @@ impl SessionActor {
             Some(msg) => msg,
             None => {
                 tracing::error!(
-                    session_id = % self.session_info.id.0, conversation_len = conv_len,
+                    session_id = %self.session_info.id.0,
+                    conversation_len = conv_len,
                     "Compaction failed: no system message in conversation history"
                 );
                 return Err(acp::Error::internal_error()
@@ -911,7 +966,8 @@ impl SessionActor {
         };
         if simplified_messages.is_empty() {
             tracing::error!(
-                session_id = % self.session_info.id.0, conversation_len = conv_len,
+                session_id = %self.session_info.id.0,
+                conversation_len = conv_len,
                 "Compaction failed: simplified conversation is empty"
             );
             return Err(acp::Error::internal_error()
@@ -922,7 +978,8 @@ impl SessionActor {
             .any(|msg| matches!(msg, ConversationItem::System(_)))
         {
             tracing::error!(
-                session_id = % self.session_info.id.0, conversation_len = conv_len,
+                session_id = %self.session_info.id.0,
+                conversation_len = conv_len,
                 simplified_len = simplified_messages.len(),
                 "Compaction failed: no system message in simplified conversation"
             );
@@ -931,13 +988,12 @@ impl SessionActor {
         }
         let sampling_config = self.reconstruct_full_config().await;
         let sampling_client = self.prepare_chat_completion(false).await?;
-        let use_backend_search =
-            self.agent.borrow().backend_search_enabled() && self.supports_backend_search.get();
+        let backend_search_active = self.backend_search_active();
         let effective_tool_defs: Vec<xai_grok_sampling_types::ToolDefinition> = self
             .prepare_tool_definitions()
             .await
             .into_iter()
-            .filter(|td| !use_backend_search || td.function.name != "web_search")
+            .filter(|td| !backend_search_active || td.function.name != "web_search")
             .collect();
         let compaction_tool_tokens =
             xai_chat_state::estimate_tool_definitions_tokens(&effective_tool_defs);
@@ -946,11 +1002,7 @@ impl SessionActor {
             .map(xai_grok_sampling_types::ToolSpec::from)
             .collect();
         let compaction_hosted_tools: Vec<xai_grok_sampling_types::HostedTool> =
-            if use_backend_search {
-                self.agent.borrow().hosted_tools().to_vec()
-            } else {
-                Vec::new()
-            };
+            self.hosted_tools_for_turn();
         tracing::info!(
             num_tools = compaction_tools.len(),
             tool_tokens = compaction_tool_tokens,
@@ -995,12 +1047,17 @@ impl SessionActor {
             user_context.clone(),
             compaction_tools.clone(),
             compaction_hosted_tools.clone(),
+            compaction_tool_tokens,
             sampling_client,
             self.session_info.id.clone(),
             sampling_config.clone(),
             self.inference_idle_timeout,
             wall_clock_budget_secs,
             self.compaction.tool_choice,
+<<<<<<< HEAD
+=======
+            cancel.clone(),
+>>>>>>> d92c5b0b8582fda358de1f97446aa74af44a464f
         );
         let observer =
             crate::session::helpers::full_replace_compaction::ShellFullReplaceObserver::new(
@@ -1061,6 +1118,13 @@ impl SessionActor {
                     deterministic,
                     context_overflow,
                 }) => {
+                    if cancel.is_cancelled()
+                        || message.contains(
+                            crate::session::helpers::session_compact::COMPACT_CANCELLED_MSG,
+                        )
+                    {
+                        return self.emit_compact_cancelled(auto_trigger).await;
+                    }
                     if context_overflow {
                         let next_stage = match input_stage {
                             InputStage::Verbatim => Some(InputStage::VerbatimFitted),
@@ -1082,8 +1146,9 @@ impl SessionActor {
                                 },
                             );
                             tracing::warn!(
-                                session_id = % self.session_info.id.0, ? stage, error = %
-                                message,
+                                session_id = %self.session_info.id.0,
+                                ?stage,
+                                error = %message,
                                 "Compaction input overflowed deterministically; stepping down the input ladder to avoid an incompactable state"
                             );
                             let conv = self.chat_state_handle.get_conversation().await;
@@ -1150,12 +1215,9 @@ impl SessionActor {
             }
         }
         let telemetry = observer.into_telemetry();
-        if two_pass_output.is_none() {
-            let request_chat_history = build_compaction_chat_history(
-                request_turns,
-                user_context.as_deref(),
-                use_short_prompt,
-            );
+        if two_pass_output.is_none()
+            && let Some(request_chat_history) = sampler.take_last_attempted_items()
+        {
             self.persist_compaction_request_artifact(
                 request_chat_history,
                 compaction_tools,
@@ -1222,8 +1284,7 @@ impl SessionActor {
                     .await
                     .into_iter()
                     .collect();
-                let bridge_for_skills = self.agent.borrow().tool_bridge().clone();
-                let skills = bridge_for_skills.slash_skills().await;
+                let skills = self.slash_skills_for_resolve().await;
                 let edited_paths = self.chat_state_handle.get_agent_edited_paths().await;
                 let ctx = {
                     let bridge_tasks = self
@@ -1345,6 +1406,7 @@ impl SessionActor {
                             agent_edited_paths: edited_paths.clone(),
                             connected_mcp_servers,
                             todos,
+                            ..Default::default()
                         },
                     )
                     .await
@@ -1371,10 +1433,11 @@ impl SessionActor {
                     (Some(poll), Some(cancel)) => Some(SubagentToolNames { poll, cancel }),
                     (poll, cancel) => {
                         tracing::warn!(
-                            session_id = % self.session_info.id.0, poll_resolved = poll
-                            .is_some(), cancel_resolved = cancel.is_some(),
+                            session_id = %self.session_info.id.0,
+                            poll_resolved = poll.is_some(),
+                            cancel_resolved = cancel.is_some(),
                             "could not resolve subagent tool names, \
-                                 omitting subagent reminder from compacted conversation"
+                             omitting subagent reminder from compacted conversation"
                         );
                         None
                     }
@@ -1409,7 +1472,8 @@ impl SessionActor {
                     crate::session::memory::MemoryBackendImpl::from_session_params(
                         storage.clone(),
                         &crate::session::memory::MemoryBackendParams {
-                            search_source: "compaction_recovery",
+                            search_source:
+                                crate::session::memory::MemorySearchSource::CompactionRecovery,
                             ..params.clone()
                         },
                     )
@@ -1470,7 +1534,7 @@ impl SessionActor {
                     )),
                     (existing, None) => {
                         tracing::warn!(
-                            session_id = % self.session_info.id.0,
+                            session_id = %self.session_info.id.0,
                             "compaction: plan mode active but template render failed"
                         );
                         existing
@@ -1489,15 +1553,16 @@ impl SessionActor {
                     .compaction_recovery_count
                     .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
                 tracing::debug!(
-                    target : xai_grok_telemetry::memory_log::TARGET, count = n,
-                    "MEMORY_COMPACTION_RECOVERY: {} search(es) performed", n,
+                    target: xai_grok_telemetry::memory_log::TARGET,
+                    count = n,
+                    "MEMORY_COMPACTION_RECOVERY: {} search(es) performed",
+                    n,
                 );
             }
         }
         let agents_md_reminder = self.agent.borrow().agents_md_user_reminder();
         let compaction_context = state_context.for_compaction();
         let compaction_state_context: &CompactionStateContext = &compaction_context;
-        self.persist_compaction_segment(&segment_messages, &generate_session_compact);
         let transcript_hint = self.transcript_hint();
         let summary_count = self
             .compaction
@@ -1519,9 +1584,9 @@ impl SessionActor {
             sanitize_result.items
         } else {
             tracing::warn!(
-                session_id = % self.session_info.id, stripped_count = sanitize_result
-                .stripped_tool_call_ids.len(), stripped_ids = ? sanitize_result
-                .stripped_tool_call_ids,
+                session_id = %self.session_info.id,
+                stripped_count = sanitize_result.stripped_tool_call_ids.len(),
+                stripped_ids = ?sanitize_result.stripped_tool_call_ids,
                 "compaction: stripped orphaned ToolResults from compacted history"
             );
             sanitize_result.items
@@ -1531,8 +1596,9 @@ impl SessionActor {
             compacted_history
         } else {
             tracing::error!(
-                session_id = % self.session_info.id, violation_count =
-                remaining_violations.len(), violation_ids = ? remaining_violations,
+                session_id = %self.session_info.id,
+                violation_count = remaining_violations.len(),
+                violation_ids = ?remaining_violations,
                 "compaction: sanitized history still has invalid ToolResults -- \
                  falling back to minimal compacted history (no recent_messages)"
             );
@@ -1541,7 +1607,7 @@ impl SessionActor {
                 user_message_prefix,
                 agents_md_reminder,
                 state_context: &state_context.for_compaction(),
-                compaction_summary: generate_session_compact,
+                compaction_summary: generate_session_compact.clone(),
                 system_reminder,
                 summary_before_recent: use_short_prompt,
                 transcript_hint,
@@ -1549,8 +1615,6 @@ impl SessionActor {
             })
         };
         let prompt_index_at_compaction = self.chat_state_handle.get_prompt_index().await;
-        self.chat_state_handle
-            .record_compaction_at(prompt_index_at_compaction);
         let original_user_info = self
             .chat_state_handle
             .get_conversation_item_at(1)
@@ -1566,6 +1630,12 @@ impl SessionActor {
                 }
                 _ => None,
             });
+        if cancel.is_cancelled() {
+            return self.emit_compact_cancelled(auto_trigger).await;
+        }
+        self.persist_compaction_segment(&segment_messages, &generate_session_compact);
+        self.chat_state_handle
+            .record_compaction_at(prompt_index_at_compaction);
         self.persist_compaction_checkpoint(
             &compacted_history,
             prompt_index_at_compaction,
@@ -1606,7 +1676,8 @@ impl SessionActor {
                     .auto_compact_suppressed
                     .store(SUPPRESS_STICKY, std::sync::atomic::Ordering::Relaxed);
                 tracing::warn!(
-                    session_id = % self.session_info.id.0, post_replace_tokens,
+                    session_id = %self.session_info.id.0,
+                    post_replace_tokens,
                     context_window,
                     "compaction: released history still over threshold; suppressing AUTO to avoid a re-loop"
                 );
@@ -1626,10 +1697,7 @@ impl SessionActor {
             .context_injected
             .store(false, std::sync::atomic::Ordering::Relaxed);
         if self.memory.is_enabled() {
-            tracing::info!(
-                target : xai_grok_telemetry::memory_log::TARGET,
-                "MEMORY_COMPACT: post-compaction reset, next turn re-checks injection (search only if no block persisted)"
-            );
+            tracing::info!(target: xai_grok_telemetry::memory_log::TARGET, "MEMORY_COMPACT: post-compaction reset, next turn re-checks injection (search only if no block persisted)");
         }
         let _ = self
             .notifications
@@ -1843,7 +1911,10 @@ impl SessionActor {
         let overflow = estimated_total.saturating_sub(cw);
         let percentage = xai_token_estimation::usage_percentage_u8(estimated_total, cw);
         tracing::warn!(
-            estimated_total, context_window = cw, overflow, model = % cfg.model,
+            estimated_total,
+            context_window = cw,
+            overflow,
+            model = %cfg.model,
             "CONTEXT_OVERFLOW_PREFLIGHT: estimated tokens exceed context window \
              after tool call outputs"
         );
@@ -1853,38 +1924,32 @@ impl SessionActor {
             percentage,
         })
     }
-    /// On a model change, clear stale suppression the switch can resolve (sticky
-    /// size/schema — the new window may fit — and a stale per-turn `other`), then
-    /// compact now if the new window is smaller. Account-state suppression
-    /// (credit/auth → `SUPPRESS_UNTIL_SUCCESS`) is left intact — a switch can't
-    /// restore credits or fix auth — and short-circuits the compaction.
-    pub(crate) async fn maybe_compact_on_model_switch(self: &Arc<Self>) {
+    /// On model change: clear sticky/other suppress and compact if the window shrank.
+    /// Leaves credit/auth suppress (a switch can't fix those) and short-circuits.
+    /// Auth compact failures abort the turn (same as pre-sampling/preflight).
+    pub(crate) async fn maybe_compact_on_model_switch(self: &Arc<Self>) -> Result<(), acp::Error> {
+        self.refresh_token_if_expired().await;
         let Some(prev) = self.compaction.previous_model.take() else {
-            return;
+            return Ok(());
         };
         let Some(cfg) = self.chat_state_handle.get_sampling_config().await else {
-            return;
+            return Ok(());
         };
         if cfg.model == prev.model_slug {
-            return;
+            return Ok(());
         }
-        if self
-            .compaction
-            .auto_compact_suppressed
-            .load(std::sync::atomic::Ordering::Relaxed)
-            == SUPPRESS_UNTIL_SUCCESS
-        {
-            return;
+        if self.is_account_state_suppressed() {
+            return Ok(());
         }
         self.compaction
             .auto_compact_suppressed
             .store(SUPPRESS_NONE, std::sync::atomic::Ordering::Relaxed);
         if prev.context_window <= cfg.context_window.get() {
-            return;
+            return Ok(());
         }
         let total_tokens = self.chat_state_handle.get_estimated_total_tokens().await;
         let Some(trigger_info) = self.should_auto_compact(total_tokens, cfg.context_window) else {
-            return;
+            return Ok(());
         };
         tracing::info!(
             "Proactive model-switch compact: {} ({}) -> {} ({}), {}% full",
@@ -1895,8 +1960,12 @@ impl SessionActor {
             trigger_info.percentage,
         );
         if let Err(e) = self.run_compact_only(trigger_info).await {
-            tracing::error!(error = % e, "Model-switch compaction failed");
+            tracing::error!(error = %e, "Model-switch compaction failed");
+            if Self::is_auth_compact_error(&e) {
+                return Err(self.surface_compact_auth_failure(e).await);
+            }
         }
+        Ok(())
     }
     /// Record the current model for model-switch detection on the next turn.
     pub(crate) async fn record_turn_model(&self) {
@@ -1930,6 +1999,7 @@ impl SessionActor {
         trigger_info: AutoCompactTriggerInfo,
     ) -> Result<(), acp::Error> {
         use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
+        let (_cancel, _cancel_scope) = self.compaction.cancel.enter();
         self.record_compaction_variant();
         let tokens_before = self.chat_state_handle.get_total_tokens().await;
         tracing::Span::current().record("pre_tokens", tokens_before as i64);
@@ -1980,11 +2050,16 @@ impl SessionActor {
                 let span = tracing::Span::current();
                 span.record("success", false);
                 span.record("error", e.to_string().as_str());
-                if self
-                    .compaction
-                    .auto_compact_suppressed
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    == SUPPRESS_NONE
+                let cancelled = self.compaction.cancel.is_cancelled()
+                    || e.data.as_ref().and_then(|d| d.as_str()).is_some_and(|s| {
+                        s.contains(crate::session::helpers::session_compact::COMPACT_CANCELLED_MSG)
+                    });
+                if !cancelled
+                    && self
+                        .compaction
+                        .auto_compact_suppressed
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        == SUPPRESS_NONE
                 {
                     self.send_xai_notification(XaiSessionUpdate::AutoCompactFailed {
                         error: String::new(),
@@ -2065,7 +2140,7 @@ impl SessionActor {
             .is_err()
         {
             tracing::warn!(
-                session_id = % self.session_info.id.0,
+                session_id = %self.session_info.id.0,
                 "Failed to send compaction request artifact to persistence channel"
             );
         }
@@ -2121,6 +2196,7 @@ impl SessionActor {
     }
 }
 #[cfg(test)]
+<<<<<<< HEAD
 mod inline_auto_compact_flow_tests {
     use super::super::support::*;
     use super::super::*;
@@ -3322,3 +3398,7 @@ mod inline_auto_compact_flow_tests {
             .await;
     }
 }
+=======
+#[path = "compaction_inline_auto_compact_flow_tests.rs"]
+mod inline_auto_compact_flow_tests;
+>>>>>>> d92c5b0b8582fda358de1f97446aa74af44a464f

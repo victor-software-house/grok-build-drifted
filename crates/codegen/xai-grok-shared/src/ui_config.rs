@@ -47,6 +47,13 @@ pub struct UiConfig {
     /// Written by the pager's settings modal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page_flip_on_send: Option<bool>,
+<<<<<<< HEAD
+=======
+    /// Ask before rewinding conversation history. `None` = on (default).
+    /// Written by the pager's settings modal / rewind "Yes, and don't ask again".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm_before_rewind: Option<bool>,
+>>>>>>> d92c5b0b8582fda358de1f97446aa74af44a464f
     /// Theme to use when the OS is in dark mode. Written by the pager's theme persist module.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_dark_theme: Option<String>,
@@ -92,6 +99,11 @@ pub struct UiConfig {
     /// `[voice].language` for the session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice_stt_language: Option<String>,
+    /// Whether the Ctrl+Space / F8 voice-dictation shortcut is active. Written
+    /// by the settings modal; unset defaults to `true` (shortcut on). When
+    /// `false` the chord is ignored — `/voice` still starts dictation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_keybind_enabled: Option<bool>,
     /// When `true`, registers `Ctrl+R` (while scrollback is focused) to toggle
     /// terminal mouse reporting (mouse capture) so users can hand selection back
     /// to the terminal for native click-drag copy/paste. Opt-in only; unset/false
@@ -160,6 +172,14 @@ pub struct UiConfig {
     /// only appears once a user toggles a tip.
     #[serde(default, skip_serializing_if = "ContextualHints::is_default")]
     pub contextual_hints: ContextualHints,
+    /// Combine consecutive queued follow-ups into one turn. `None` = off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub combine_queued_prompts: Option<bool>,
+    /// Mid-turn follow-up routing: `"queue"` (default) or `"steer"`. `None`
+    /// behaves as queue. Steer promotes server-queued follow-ups as
+    /// interjections at the next tool or model safe point.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_up_behavior: Option<String>,
     /// Display-refresh probe + auto-cadence (`[ui.display_refresh]`). Per-field
     /// `None` inherits remote/default; skipped when untouched.
     #[serde(default, skip_serializing_if = "DisplayRefreshSettings::is_default")]
@@ -249,6 +269,10 @@ impl Default for UiConfig {
             show_timestamps: None,
             show_timeline: None,
             page_flip_on_send: None,
+<<<<<<< HEAD
+=======
+            confirm_before_rewind: None,
+>>>>>>> d92c5b0b8582fda358de1f97446aa74af44a464f
             auto_dark_theme: None,
             auto_light_theme: None,
             scroll_speed: None,
@@ -260,6 +284,7 @@ impl Default for UiConfig {
             hunk_tracker_mode: None,
             voice_capture_mode: None,
             voice_stt_language: None,
+            voice_keybind_enabled: None,
             mouse_reporting_toggle: None,
             remember_tool_approvals: None,
             cancel_subagents_on_turn_cancel: None,
@@ -273,6 +298,8 @@ impl Default for UiConfig {
             screen_mode: None,
             double_click_action: None,
             contextual_hints: ContextualHints::default(),
+            combine_queued_prompts: None,
+            follow_up_behavior: None,
             display_refresh: DisplayRefreshSettings::default(),
         }
     }
@@ -305,6 +332,34 @@ impl UiConfig {
             .unwrap_or(Self::PAGE_FLIP_ON_SEND_DEFAULT)
     }
 
+<<<<<<< HEAD
+=======
+    /// Default for [`Self::confirm_before_rewind`] when unset.
+    pub const CONFIRM_BEFORE_REWIND_DEFAULT: bool = true;
+
+    pub fn confirm_before_rewind_enabled(&self) -> bool {
+        self.confirm_before_rewind
+            .unwrap_or(Self::CONFIRM_BEFORE_REWIND_DEFAULT)
+    }
+
+    /// Canonical default for `[ui].follow_up_behavior`.
+    pub const FOLLOW_UP_BEHAVIOR_DEFAULT: &'static str = "queue";
+
+    /// Resolved follow-up behavior: `"queue"` or `"steer"`.
+    /// Unknown values fall back to queue.
+    pub fn follow_up_behavior(&self) -> &'static str {
+        match self.follow_up_behavior.as_deref() {
+            Some("steer") => "steer",
+            _ => Self::FOLLOW_UP_BEHAVIOR_DEFAULT,
+        }
+    }
+
+    /// True when mid-turn follow-ups should promote as interjections (Steer).
+    pub fn follow_up_steer_enabled(&self) -> bool {
+        self.follow_up_behavior() == "steer"
+    }
+
+>>>>>>> d92c5b0b8582fda358de1f97446aa74af44a464f
     /// True when the highlight should not timer-dismiss (`hold` / `word_select`,
     /// or legacy duration 0).
     pub fn keep_text_selection_enabled(&self) -> bool {
@@ -330,6 +385,19 @@ mod tests {
     }
 
     #[test]
+<<<<<<< HEAD
+=======
+    fn confirm_before_rewind_defaults_on() {
+        assert!(UiConfig::default().confirm_before_rewind_enabled());
+        let off = UiConfig {
+            confirm_before_rewind: Some(false),
+            ..Default::default()
+        };
+        assert!(!off.confirm_before_rewind_enabled());
+    }
+
+    #[test]
+>>>>>>> d92c5b0b8582fda358de1f97446aa74af44a464f
     fn keep_text_selection_enabled_precedence() {
         let mut ui = UiConfig::default();
         assert!(!ui.keep_text_selection_enabled());
