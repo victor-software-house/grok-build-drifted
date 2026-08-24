@@ -571,11 +571,8 @@ fn parse_goto_input(text: &str, max_lines: usize) -> GotoTarget {
     }
 }
 
-// ===========================================================================
-// Tests
-// ===========================================================================
-
 #[cfg(test)]
+<<<<<<< HEAD
 mod tests {
     use super::*;
     use crate::key;
@@ -2776,3 +2773,7 @@ mod tests {
         assert_eq!(state.input_text(), "a\nb");
     }
 }
+=======
+#[path = "state_tests.rs"]
+mod tests;
+>>>>>>> 07b2f7144fd5c5c9d3dd1966937a87852d2dbdb8

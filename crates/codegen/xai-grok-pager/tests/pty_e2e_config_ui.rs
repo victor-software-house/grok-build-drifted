@@ -24,6 +24,11 @@ mod critical_announcement_session_banner_pty;
 mod dashboard_overlay_tab_esc_backout_and_ctrl_backslash;
 #[path = "pty_e2e/extensions_modal_copy_hints_pty.rs"]
 mod extensions_modal_copy_hints_pty;
+<<<<<<< HEAD
+=======
+#[path = "pty_e2e/extensions_modal_workflows_tab_pty.rs"]
+mod extensions_modal_workflows_tab_pty;
+>>>>>>> 07b2f7144fd5c5c9d3dd1966937a87852d2dbdb8
 #[path = "pty_e2e/iterm_readline_editing.rs"]
 mod iterm_readline_editing;
 #[path = "pty_e2e/prompt_suggestion_ghost_tab_accepts.rs"]

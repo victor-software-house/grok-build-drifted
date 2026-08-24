@@ -7,9 +7,9 @@ use ratatui::layout::Rect;
 use crate::app::actions::Action;
 use crate::input::line_editor::LineEditor;
 use crate::settings::{
-    EnumChoice, OwnedEnumChoice, PagerLocalSnapshot, SettingCategory, SettingKey, SettingKind,
-    SettingMeta, SettingValue, SettingsRegistry, StringValidator, current_value_for,
-    dynamic_enum_choices,
+    CodingDataSharingLock, EnumChoice, OwnedEnumChoice, PagerLocalSnapshot, SettingCategory,
+    SettingKey, SettingKind, SettingMeta, SettingValue, SettingsRegistry, StringValidator,
+    current_value_for, dynamic_enum_choices,
 };
 use crate::views::modal_window::ModalWindowState;
 
@@ -54,6 +54,8 @@ pub enum SettingsKeyOutcome {
     /// Used by `d`-reset-in-picker to revert preview before opening
     /// the reset-confirm overlay.
     ActionPair(Action, Action),
+    /// Close the modal and dispatch `Action` (deep-link Esc revert or Enter commit).
+    ActionThenClose(Action),
     /// Internal state mutation, no action.
     Changed,
     /// No-op.
@@ -155,6 +157,17 @@ pub(super) enum SettingsMode {
         min: i64,
         max: i64,
     },
+<<<<<<< HEAD
+=======
+}
+
+/// Is the open sub-pane a [`crate::settings::is_consent_chooser`] pane?
+pub(super) fn mode_is_consent_chooser(mode: &SettingsMode) -> bool {
+    matches!(
+        mode,
+        SettingsMode::PickingEnum { key, .. } if crate::settings::is_consent_chooser(key)
+    )
+>>>>>>> 07b2f7144fd5c5c9d3dd1966937a87852d2dbdb8
 }
 
 /// Settings modal state. Boxed inside `ActiveModal::Settings` to
@@ -202,6 +215,10 @@ pub struct SettingsModalState {
     /// `rows` in Browse, `picker_choice_rects` in PickingEnum,
     /// always `None` in EditingValue.
     pub hover_row: Option<usize>,
+    /// When true, Esc/Enter from `PickingEnum` close the modal instead of
+    /// returning to Browse. Set by deep-link open (`OpenSettingsFocus`
+    /// / `/privacy`); cleared on leave from the picker.
+    pub close_on_picker_exit: bool,
 }
 
 impl SettingsModalState {
@@ -240,6 +257,17 @@ impl SettingsModalState {
             breadcrumb_hovered: false,
             expanded_keys: std::collections::HashSet::new(),
             hover_row: None,
+            close_on_picker_exit: false,
+        }
+    }
+
+    /// Why a Browse row cannot be edited (`None` = editable). Consulted by
+    /// both render and input.
+    pub fn row_lock(&self, key: SettingKey) -> Option<CodingDataSharingLock> {
+        if key == "coding_data_sharing" {
+            self.pager_snapshot.coding_data_sharing_lock
+        } else {
+            None
         }
     }
 
@@ -252,6 +280,21 @@ impl SettingsModalState {
             }
             RowEntry::Header { .. } => None,
         }
+    }
+
+    /// Focus a setting by registry key (Browse mode). Returns whether the
+    /// key was found; no-op if missing.
+    pub fn focus_key(&mut self, key: &str) -> bool {
+        if let Some(idx) = self
+            .rows
+            .iter()
+            .position(|r| matches!(r, RowEntry::Setting { key: k, .. } if *k == key))
+        {
+            self.selected = idx;
+            self.clamp_selected_to_visible();
+            return true;
+        }
+        false
     }
 
     /// Filtered row indices in render order.
@@ -474,6 +517,60 @@ impl SettingsModalState {
         self.hover_row = None;
         self.settings_breadcrumb_rect = None;
         self.breadcrumb_hovered = false;
+        self.close_on_picker_exit = false;
+    }
+
+    pub fn focus_filter(&mut self) {
+        self.state.mode = SettingsMode::FilterFocused;
+    }
+
+    pub(super) fn transition_to_picking_enum(
+        &mut self,
+        key: SettingKey,
+        choices_idx: usize,
+        original_value: SettingValue,
+        supports_preview: bool,
+    ) {
+        self.state.mode = SettingsMode::PickingEnum {
+            key,
+            choices_idx,
+            original_value,
+            supports_preview,
+        };
+    }
+
+    pub(super) fn transition_to_picking_group(&mut self, key: SettingKey, child_idx: usize) {
+        self.state.mode = SettingsMode::PickingGroup { key, child_idx };
+    }
+
+    pub(super) fn transition_to_editing_string(
+        &mut self,
+        key: SettingKey,
+        editor: LineEditor,
+        validator: StringValidator,
+        validation_error: Option<String>,
+    ) {
+        self.state.mode = SettingsMode::EditingString {
+            key,
+            editor,
+            validator,
+            validation_error,
+        };
+    }
+
+    pub(super) fn transition_to_editing_int(
+        &mut self,
+        key: SettingKey,
+        buffer: String,
+        min: i64,
+        max: i64,
+    ) {
+        self.state.mode = SettingsMode::EditingInt {
+            key,
+            buffer,
+            min,
+            max,
+        };
     }
 
     pub fn focus_filter(&mut self) {
@@ -536,6 +633,9 @@ impl SettingsModalState {
             let Some((key, meta)) = self.focused_setting() else {
                 return false;
             };
+            if self.row_lock(key).is_some() {
+                return false;
+            }
             // Handles both static `Enum` and `DynamicEnum` catalogs.
             let (supports_preview, resolved): (bool, Vec<OwnedEnumChoice>) = match &meta.kind {
                 SettingKind::Enum {
@@ -773,7 +873,12 @@ pub(super) fn setting_row_visible(
     minimal: bool,
     voice_mode: bool,
 ) -> bool {
-    if !voice_mode && matches!(meta.key, "voice_capture_mode" | "voice_stt_language") {
+    if !voice_mode
+        && matches!(
+            meta.key,
+            "voice_keybind_enabled" | "voice_capture_mode" | "voice_stt_language"
+        )
+    {
         return false;
     }
     if meta.key == "voice_capture_mode" && !kitty_releases {
@@ -786,7 +891,7 @@ pub(super) fn setting_row_visible(
 }
 
 fn build_rows(registry: &SettingsRegistry) -> Vec<RowEntry> {
-    let kitty_releases = crate::app::kitty_flags_pushed();
+    let kitty_releases = crate::app::kitty_releases_reported();
     let minimal = crate::app::minimal_mode_active();
     let voice_mode = crate::app::voice_mode_enabled();
     // Keys that belong to a group sub-sheet are rendered only inside that
@@ -843,6 +948,7 @@ pub(super) fn action_for_bool(key: SettingKey, new: bool) -> Option<Action> {
         "contextual_hints.ssh_wrap" => Some(Action::SetContextualHintSshWrap(new)),
         "multiline_mode" => Some(Action::SetMultilineMode(new)),
         "vim_mode" => Some(Action::SetVimMode(new)),
+        "voice_keybind_enabled" => Some(Action::SetVoiceKeybindEnabled(new)),
         "remember_tool_approvals" => Some(Action::SetRememberToolApprovals(new)),
         "toolset.ask_user_question.timeout_enabled" => {
             Some(Action::SetAskUserQuestionTimeoutEnabled(new))
@@ -853,6 +959,12 @@ pub(super) fn action_for_bool(key: SettingKey, new: bool) -> Option<Action> {
         "prompt_suggestions" => Some(Action::SetPromptSuggestions(new)),
         "respect_manual_folds" => Some(Action::SetRespectManualFolds(new)),
         "page_flip_on_send" => Some(Action::SetPageFlipOnSend(new)),
+<<<<<<< HEAD
+=======
+        "confirm_before_rewind" => Some(Action::SetConfirmBeforeRewind(new)),
+        "combine_queued_prompts" => Some(Action::SetCombineQueuedPrompts(new)),
+
+>>>>>>> 07b2f7144fd5c5c9d3dd1966937a87852d2dbdb8
         "invert_scroll" => Some(Action::SetInvertScroll(new)),
         "show_tips" => Some(Action::SetShowTips(new)),
         "auto_update" => Some(Action::SetAutoUpdate(new)),
@@ -930,6 +1042,8 @@ pub(super) fn action_for_enum_commit(key: SettingKey, choice: &'static str) -> O
         "scroll_mode" => {
             crate::appearance::ScrollMode::from_canonical(choice).map(Action::SetScrollMode)
         }
+        "follow_up_behavior" => crate::appearance::FollowUpBehavior::from_canonical(choice)
+            .map(Action::SetFollowUpBehavior),
         "default_selected_permission" => {
             Some(Action::SetDefaultSelectedPermission(choice.to_string()))
         }
@@ -1008,7 +1122,7 @@ pub(super) fn validate_string(
             }
             // Reject if the model catalog hasn't loaded yet.
             if available_models.is_empty() {
-                return Some("Model catalog still loading — try again".to_string());
+                return Some("Model catalog still loading, try again".to_string());
             }
             let matched = available_models
                 .iter()
@@ -1060,7 +1174,7 @@ pub(super) fn effective_enum_choices<'a>(
     choices: &'a [EnumChoice],
     snapshot: &PagerLocalSnapshot,
 ) -> Vec<&'a EnumChoice> {
-    let kitty_releases = crate::app::kitty_flags_pushed();
+    let kitty_releases = crate::app::kitty_releases_reported();
     choices
         .iter()
         .filter(|c| {
