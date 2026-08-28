@@ -111,6 +111,34 @@ Use Ctrl+V for screenshots, browser \"Copy Image\", and file-manager image \
 copies.\n\
 You can also drag an image file into the prompt.";
 
+// Undo/redo are textarea chords, not ActionRegistry entries. Super/Cmd also
+// works where the terminal delivers it; list Ctrl only (hosts often swallow Super).
+const UNDO_LONG_HELP: &str = "\
+Undoes the last change in the prompt editor.\n\
+Covers typing, deletes, line/word kills, and clearing a draft.";
+
+const REDO_LONG_HELP: &str = "\
+Redoes the last undone change in the prompt editor.\n\
+Ctrl+Shift+Z is primary; Ctrl+R is an alternate.";
+
+// Prompt history is not an ActionRegistry entry: Up is an inline key handler and
+// /history is a slash command. Surface both here for discoverability.
+const HISTORY_LONG_HELP: &str = "\
+Recalls previously sent prompts.\n\
+Press Up on an empty prompt to browse earlier prompts, newest first; each move \
+live-populates the composer so you can edit and resend.\n\
+With prompts queued, Up moves focus into the queue pane on the last row instead.\n\
+Run /history to open a searchable history panel and filter by text.";
+
+// Scrollback search has no ActionRegistry entry: it's the vim `/` inline handler,
+// or the /find slash command in simple mode. Surface both triggers here.
+const SCROLLBACK_SEARCH_LONG_HELP: &str = "\
+Searches the conversation scrollback for text and jumps between matches.\n\
+In the prompt input, run /find to search. In vim mode, you can also press / \
+while the scrollback is focused.\n\
+Type a query, then use n and N (or the arrow keys) to step through matches. \
+Press Enter to jump to a match and Esc to dismiss.";
+
 /// Build the entries vector for the modal, grouped by category.
 ///
 /// All registered actions are included, grouped by category. Actions
@@ -168,12 +196,14 @@ pub fn build_entries(
                 continue;
             }
             // The voice chord (`Ctrl+Space`) is hidden when the voice gate is
-            // off (remote kill switch / `GROK_VOICE_MODE=0`). Unlike the old
-            // `Ctrl+Shift+M`, `Ctrl+Space` decodes the same with or without the
-            // Kitty keyboard protocol (it just toggles instead of hold-to-talk
-            // without it), so it's shown on every terminal once the gate is on.
+            // off (remote kill switch / `GROK_VOICE_MODE=0`) or the user turned
+            // the Voice shortcut setting off — don't advertise keys that do
+            // nothing. `Ctrl+Space` decodes the same with or without the Kitty
+            // keyboard protocol (it just toggles instead of hold-to-talk), so
+            // it's shown on every terminal once the gates are on.
             // EnableVoiceMode is slash-only and already dropped above.
-            if def.id == crate::actions::ActionId::VoiceToggle && !crate::app::voice_mode_enabled()
+            if def.id == crate::actions::ActionId::VoiceToggle
+                && (!crate::app::voice_mode_enabled() || !crate::app::voice_keybind_enabled())
             {
                 continue;
             }
@@ -261,24 +291,71 @@ pub fn build_entries(
                 item,
                 dimmed,
                 action_id: None,
-                long_help: None,
+                long_help: Some(SCROLLBACK_SEARCH_LONG_HELP),
             });
         }
-        // Paste is handled by `is_paste_key`, not the registry. Ctrl+V always;
-        // Windows also Alt+V as a fallback. Super/Cmd omitted — many terminals
-        // swallow it. Lit on the agent prompt and the dashboard (both paste).
-        if cat == Category::Input {
-            let mut item = HintItem::new(crate::key!('v', CONTROL), "paste");
-            item.description = Some("Paste images (and text) from the clipboard".into());
-            #[cfg(target_os = "windows")]
-            item.keys.push(crate::key!('v', ALT));
-            let dimmed = !active_contexts.contains(&When::PromptFocused)
-                && !active_contexts.contains(&When::DashboardFocused);
+        // Simple mode reaches scrollback search via the `/find` slash command,
+        // not a keystroke: use a null key + custom display so the raw key list
+        // stays empty of `/`.
+        if !vim_mode && cat == Category::ConversationNav {
+            let mut item = HintItem::new(crate::key!(Null), "search");
+            item.custom_display = Some("/find");
+            item.description = Some("Search scrollback".into());
+            // `/find` is a slash command typed at the prompt (not a scrollback
+            // keystroke like the vim `/` above), so it is available when the
+            // prompt is focused — dim on `!PromptFocused`, not scrollback.
+            let dimmed = !active_contexts.contains(&When::PromptFocused);
             entries.push(ShortcutsHelpEntry::Hint {
                 item,
                 dimmed,
                 action_id: None,
-                long_help: Some(PASTE_LONG_HELP),
+                long_help: Some(SCROLLBACK_SEARCH_LONG_HELP),
+            });
+        }
+        // Clipboard + textarea chords not in ActionRegistry. Super/Cmd omitted
+        // (often swallowed). Lit on agent prompt and dashboard reply hosts.
+        if cat == Category::Input {
+            let dimmed = !active_contexts.contains(&When::PromptFocused)
+                && !active_contexts.contains(&When::DashboardFocused);
+            let push_pseudo = |entries: &mut Vec<ShortcutsHelpEntry>,
+                               item: HintItem,
+                               long_help: Option<&'static str>| {
+                entries.push(ShortcutsHelpEntry::Hint {
+                    item,
+                    dimmed,
+                    action_id: None,
+                    long_help,
+                });
+            };
+
+            let mut paste = HintItem::new(crate::key!('v', CONTROL), "paste");
+            paste.description = Some("Paste images (and text) from the clipboard".into());
+            #[cfg(target_os = "windows")]
+            paste.keys.push(crate::key!('v', ALT));
+            push_pseudo(&mut entries, paste, Some(PASTE_LONG_HELP));
+
+            let mut undo = HintItem::new(crate::key!('z', CONTROL), "undo");
+            undo.description = Some("Undo the last prompt edit".into());
+            push_pseudo(&mut entries, undo, Some(UNDO_LONG_HELP));
+
+            // Textarea: Ctrl+Shift+Z (+ Ctrl+R alt). Ctrl+R is prompt-only;
+            // scrollback may bind it to mouse reporting when that toggle is on.
+            let mut redo = HintItem::new(crate::key!('z', CONTROL | SHIFT), "redo");
+            redo.description = Some("Redo the last undone prompt edit".into());
+            redo.keys.push(crate::key!('r', CONTROL));
+            push_pseudo(&mut entries, redo, Some(REDO_LONG_HELP));
+
+            // Prompt history (Up / /history). Not part of the shared paste/undo/redo
+            // `dimmed`: that also lights on DashboardFocused, but Up-history is
+            // prompt-only, so give it its own PromptFocused-scoped dim.
+            let mut history = HintItem::new(crate::key!(Up), "history");
+            history.description = Some("Prompt history".into());
+            let history_dimmed = !active_contexts.contains(&When::PromptFocused);
+            entries.push(ShortcutsHelpEntry::Hint {
+                item: history,
+                dimmed: history_dimmed,
+                action_id: None,
+                long_help: Some(HISTORY_LONG_HELP),
             });
         }
         let count = entries.len() - header_idx - 1;
@@ -468,6 +545,7 @@ fn picker_config(non_sel: &[bool]) -> PickerConfig<'_> {
         filter_label: None,
         filter_key_hint: None,
         filter_active: false,
+        header_note: None,
         action_keys: &[],
         disable_search: false,
         compact_bottom_bar: false,
@@ -527,7 +605,7 @@ impl ShortcutsHelpMode {
 /// Build detail mode state from a cheatsheet entry (title/keys/body for the man page).
 ///
 /// Registry rows always open. Pseudo-rows (`action_id: None`) open only when they
-/// ship `long_help` so list-only rows like scrollback search stay browse-only.
+/// ship `long_help`; one without it stays list-only (browse-only).
 pub fn detail_from_entry(entry: &ShortcutsHelpEntry) -> Option<ShortcutsHelpMode> {
     let ShortcutsHelpEntry::Hint {
         item,
@@ -1324,6 +1402,7 @@ pub fn render_modal(
         &[],
         Some(theme.bg_base),
         false,
+        0,
         inner_x + inner_width - 1,
     );
     state.hit_areas = Some(PickerHitAreas {
@@ -1439,6 +1518,7 @@ pub fn handle_paste(
             state.selection_hidden = false;
             state.scroll_offset = None;
             ShortcutsHelpOutcome::Changed
+<<<<<<< HEAD
         }
         crate::input::line_editor::LineEditOutcome::HandledNoChange
         | crate::input::line_editor::LineEditOutcome::CursorChanged => {
@@ -1464,13 +1544,14 @@ mod tests {
             let previous = crate::appearance::cache::load_vim_mode();
             crate::appearance::cache::set_vim_mode(enabled);
             Self(previous)
+=======
+>>>>>>> 9684fa3cdbf2995e30ea8b9b637f1db008f144fc
         }
-    }
-
-    impl Drop for VimModeGuard {
-        fn drop(&mut self) {
-            crate::appearance::cache::set_vim_mode(self.0);
+        crate::input::line_editor::LineEditOutcome::HandledNoChange
+        | crate::input::line_editor::LineEditOutcome::CursorChanged => {
+            ShortcutsHelpOutcome::Changed
         }
+<<<<<<< HEAD
     }
 
     fn header(label: &'static str, idx: usize, count: usize) -> ShortcutsHelpEntry {
@@ -3565,5 +3646,12 @@ mod tests {
             row.description_lines.is_empty(),
             "empty help must render no description line even when expanded"
         );
+=======
+        crate::input::line_editor::LineEditOutcome::Unhandled => ShortcutsHelpOutcome::Unchanged,
+>>>>>>> 9684fa3cdbf2995e30ea8b9b637f1db008f144fc
     }
 }
+
+#[cfg(test)]
+#[path = "shortcuts_help_tests.rs"]
+mod tests;
