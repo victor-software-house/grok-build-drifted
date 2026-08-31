@@ -1,5 +1,4 @@
-//! Secondary pane input: scrollback keys and search, todo/tool-usage panes,
-//! background tasks, subagent catalog, and the pane-aware scroll router.
+//! Secondary pane input: scrollback keys and search, todo/tool-usage panes, background tasks, subagent catalog, and the pane-aware scroll router.
 use super::{ActivePane, AgentPane, AgentView, overlay_action_to_outcome, resolve_action};
 use crate::actions::{ActionId, ActionRegistry, When};
 use crate::app::actions::Action;
@@ -29,7 +28,7 @@ impl AgentView {
             && (matches!(key.code, KeyCode::Tab | KeyCode::Char(' '))
                 || (allow_i_alt && matches!(key.code, KeyCode::Char('i'))))
         {
-            if self.question_view.is_some() {
+            if self.parked_card().is_some() {
                 self.set_active_pane(AgentPane::Prompt, false);
                 return InputOutcome::Changed;
             }
@@ -111,10 +110,7 @@ impl AgentView {
             self.open_scrollback_search(None);
             return InputOutcome::Changed;
         }
-        if key!('r', CONTROL).matches(key)
-            && (registry.find(ActionId::ToggleMouseCapture).is_some()
-                || crate::app::mouse_reporting_toggle_enabled())
-        {
+        if registry.lookup(key, When::ScrollbackFocused) == Some(ActionId::ToggleMouseCapture) {
             return InputOutcome::Action(Action::ToggleMouseCapture);
         }
         if let Some(outcome) =
@@ -132,19 +128,9 @@ impl AgentView {
         InputOutcome::Unchanged
     }
     /// Focus the scrollback pane and open an incremental search over it.
-    ///
-    /// Shared by the vim `/` key and the `/find` slash command so both entry
-    /// points land in the same state, refocusing scrollback when `/find` is run
-    /// from the prompt in simple mode.
-    ///
-    /// Only opens the search if the pane switch succeeds: a dirty queued-prompt
-    /// edit blocks the switch (showing the confirm modal) and returns false, so
-    /// opening search then would strand an invisible session on the prompt — the
-    /// search bar and key handling are gated on scrollback being focused.
-    ///
-    /// `initial_query` (the `/find <word>` argument) is fed through the same
-    /// keystroke path so a pre-filled search behaves identically to typing the
-    /// word into the bar: a composing regex query with immediate highlights.
+    /// Both the vim `/` key and the `/find` slash command call this, refocusing scrollback when `/find` runs from the prompt.
+    /// Opens only if the pane switch succeeds: a dirty queued-prompt edit blocks the switch, and the search bar only works with scrollback focused.
+    /// `initial_query` (the `/find <word>` argument) is fed through the keystroke path, so a pre-filled search behaves like typing into the bar.
     pub(crate) fn open_scrollback_search(&mut self, initial_query: Option<&str>) {
         if self.set_active_pane(AgentPane::Scrollback, false) {
             self.scrollback_search = Some(ScrollbackSearchState::open());
@@ -154,7 +140,7 @@ impl AgentView {
         }
     }
     /// Step to the next (`forward`) or previous match and scroll it into view.
-    /// Shared by the `n`/`N` keys and the `↓`/`↑` arrows.
+    /// Both the `n`/`N` keys and the Down/Up arrows land here.
     fn navigate_search(&mut self, forward: bool) -> Option<InputOutcome> {
         if let Some(search) = self.scrollback_search.as_mut() {
             if forward {
@@ -166,9 +152,8 @@ impl AgentView {
         self.reveal_current_search_match();
         Some(InputOutcome::Changed)
     }
-    /// Bottom scrollback rows to reserve for the search UI (divider + bar):
-    /// two when search is active, clamped to the rows that actually exist so a
-    /// very short region never pushes the bar below the scrollback rect.
+    /// Bottom scrollback rows to reserve for the search UI (divider and bar): two when search is active.
+    /// The count clamps to the rows that actually exist, so a very short region never pushes the bar below the scrollback rect.
     pub(super) fn search_reserved_rows(scrollback_height: u16, search_active: bool) -> u16 {
         if search_active {
             scrollback_height.min(2)
@@ -178,9 +163,8 @@ impl AgentView {
     }
     /// Handle a key while the scrollback search overlay is open.
     ///
-    /// Returns `None` when search isn't open (or, while browsing, for keys that
-    /// should fall through to normal scrollback handling). While composing the
-    /// query the bar is modal and swallows other keys.
+    /// Returns `None` when search isn't open (or, while browsing, for keys that should fall through to normal scrollback handling).
+    /// While composing the query the bar is modal and swallows other keys.
     fn handle_scrollback_search_key(&mut self, key: &KeyEvent) -> Option<InputOutcome> {
         let composing = self.scrollback_search.as_ref()?.is_composing();
         let non_text = KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER;
@@ -242,16 +226,22 @@ impl AgentView {
             crate::input::line_editor::LineEditOutcome::Unhandled => InputOutcome::Unchanged,
         })
     }
+<<<<<<< HEAD
     /// Enqueue `query` for the background scan. Results (and the reveal) arrive
     /// later via [`poll_scrollback_search`](Self::poll_scrollback_search); the
     /// highlight updates immediately because it reads the UI-side matcher.
+=======
+    /// Enqueue `query` for the background scan.
+    /// Results (and the reveal) arrive later via [`poll_scrollback_search`](Self::poll_scrollback_search).
+    /// The highlight updates immediately because it reads the UI-side matcher.
+>>>>>>> bc7f02eddd3d84085849dc19ed216f11c23b0571
     fn set_scrollback_search_query(&mut self, query: &str) {
         if let Some(search) = self.scrollback_search.as_mut() {
             search.update_query(query, &self.scrollback);
         }
     }
-    /// Poll the background search daemon for new results, revealing the freshly
-    /// parked match when they change. Returns `true` if the UI should redraw.
+    /// Poll the background search daemon for new results, revealing the freshly parked match when they change.
+    /// Returns `true` if the UI should redraw.
     pub(crate) fn poll_scrollback_search(&mut self) -> bool {
         let changed = self.scrollback_search.as_mut().is_some_and(|s| s.poll());
         if changed {
@@ -274,8 +264,7 @@ impl AgentView {
     }
     /// Todo-pane-focused key handling.
     ///
-    /// Routes structural keys through the shared overlay handler, then
-    /// content keys through `TodoPane::handle_key`.
+    /// Routes structural keys through the shared overlay handler, then content keys through `TodoPane::handle_key`.
     pub(super) fn handle_todo_key(
         &mut self,
         key: &KeyEvent,
@@ -315,11 +304,11 @@ impl AgentView {
     pub(super) fn handle_bg_tasks_key(
         &mut self,
         key: &KeyEvent,
-        _registry: &ActionRegistry,
+        registry: &ActionRegistry,
     ) -> InputOutcome {
         use crate::views::overlay::{handle_overlay_key, handle_overlay_nav_key};
         use crate::views::tasks_pane::TaskEntry;
-        if key!('b', CONTROL).matches(key) {
+        if registry.matches_id(ActionId::ToggleTasks, key) {
             self.tasks.overlay.toggle();
             self.tasks.on_state_change();
             if !self.tasks.overlay.focused {
@@ -375,6 +364,11 @@ impl AgentView {
                     }
                 }
                 Some(TaskEntry::Scheduled { .. }) => {}
+                Some(TaskEntry::Workflow { name, .. }) => {
+                    let name = name.clone();
+                    self.open_workflow_detail(&name);
+                    return InputOutcome::Changed;
+                }
                 Some(TaskEntry::Header { .. }) => {}
                 None => {}
             }
@@ -402,6 +396,15 @@ impl AgentView {
                 }
                 Some(TaskEntry::Scheduled { task_id, .. }) => {
                     return InputOutcome::Action(Action::CancelScheduledTask(task_id.clone()));
+                }
+                Some(TaskEntry::Workflow {
+                    name, stoppable, ..
+                }) => {
+                    if *stoppable {
+                        return InputOutcome::Action(Action::SendSlashCommandPreservingDraft(
+                            format!("/workflow stop {name}"),
+                        ));
+                    }
                 }
                 Some(TaskEntry::Header { .. }) => {}
                 None => {}
@@ -484,11 +487,21 @@ impl AgentView {
     /// Handle a normalized scroll event at a screen position.
     ///
     /// Hit-tests against pane areas to decide what to scroll:
-    /// - Scrollback area → scroll the scrollback (uses accelerated line count)
-    /// - Prompt area → forward to textarea (which has its own scroll logic)
+    /// - Scrollback area: scroll the scrollback (uses accelerated line count)
+    /// - Prompt area: forward to the textarea (which has its own scroll logic)
     ///
-    /// Positive `lines` = scroll down, negative = scroll up.
+    /// Positive `lines` scrolls down, negative scrolls up.
     pub fn handle_scroll(&mut self, lines: i32, col: u16, row: u16) {
+        if self.show_workflows {
+            let runs = self.workflow_runs_newest_first();
+            let mut view = self.workflows_view.clone();
+            view.handle_scroll(lines, col, row, &runs);
+            self.workflows_view = view;
+            return;
+        }
+        if self.show_goal_detail {
+            return;
+        }
         if let Some(ref mut modal) = self.active_modal {
             use crate::views::modal::ActiveModal;
             match modal {
@@ -534,7 +547,7 @@ impl AgentView {
         }
         if let Some(ref mut viewer) = self.line_viewer {
             if let Some(area) = viewer.last_popup_area
-                && area.contains((col, row).into())
+                && (area.contains((col, row).into()) || viewer.list_state.scrollbar_hit(col, row))
             {
                 viewer
                     .list_state
@@ -672,8 +685,7 @@ mod scroll_granularity_tests {
         CompletionDropdownState, CompletionItemParsed, SuggestionSource,
     };
     use ratatui::layout::Rect;
-    /// Selection dropdowns step exactly one item per wheel dispatch: a
-    /// 3-line notch (or accelerated trackpad flush) must not skip items.
+    /// Selection dropdowns step exactly one item per wheel dispatch: a 3-line notch (or accelerated trackpad flush) must not skip items.
     #[test]
     fn wheel_notch_over_slash_dropdown_moves_selection_one_step() {
         let mut agent = make_agent();
@@ -735,6 +747,127 @@ mod scroll_granularity_tests {
             agent.prompt.suggestions.dropdown.selected, 0,
             "-3-line wheel notch must move the completion selection by exactly -1"
         );
+    }
+    #[test]
+    fn wheel_over_fullscreen_overlays_never_scrolls_panes_beneath() {
+        let mut agent = make_agent();
+        agent.pane_areas.scrollback = Rect::new(0, 0, 80, 10);
+        for i in 0..30 {
+            agent
+                .scrollback
+                .push_block(crate::scrollback::block::RenderBlock::agent_message(
+                    format!("line {i}"),
+                ));
+        }
+        agent.scrollback.prepare_layout(80, 10);
+        agent.scrollback.scroll_up(5);
+        let before = agent.scrollback.scroll_info().0;
+        assert!(before > 0, "setup: scrollback holds a real offset");
+        agent.show_workflows = true;
+        agent.handle_scroll(3, 5, 4);
+        agent.handle_scroll(-3, 5, 4);
+        assert_eq!(
+            agent.scrollback.scroll_info().0,
+            before,
+            "wheel must not leak through the /workflow runs modal"
+        );
+        agent.show_workflows = false;
+        agent.show_goal_detail = true;
+        agent.handle_scroll(-3, 5, 4);
+        assert_eq!(
+            agent.scrollback.scroll_info().0,
+            before,
+            "wheel must not leak through the goal detail overlay"
+        );
+    }
+}
+#[cfg(test)]
+mod mouse_reporting_registry_tests {
+    use super::super::{AgentPane, test_fixtures::make_agent};
+    use crate::actions::ActionRegistry;
+    use crate::app::actions::Action;
+    use crate::app::app_view::InputOutcome;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    fn ctrl_r() -> Event {
+        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+    }
+    #[test]
+    fn mouse_toggle_chord_follows_live_mode_registry() {
+        for mode in [
+            crate::app::ScreenMode::Fullscreen,
+            crate::app::ScreenMode::Inline,
+        ] {
+            let mut agent = make_agent();
+            agent.set_active_pane(AgentPane::Scrollback, true);
+            let registry = ActionRegistry::defaults_with_config_for(mode, true);
+            assert!(matches!(
+                agent.handle_input(&ctrl_r(), &registry),
+                InputOutcome::Action(Action::ToggleMouseCapture)
+            ));
+        }
+        let mut agent = make_agent();
+        agent.set_active_pane(AgentPane::Scrollback, true);
+        let registry =
+            ActionRegistry::defaults_with_config_for(crate::app::ScreenMode::Minimal, true);
+        assert!(
+            registry
+                .find(crate::actions::ActionId::ToggleMouseCapture)
+                .is_none()
+        );
+        assert!(!matches!(
+            agent.handle_input(&ctrl_r(), &registry),
+            InputOutcome::Action(Action::ToggleMouseCapture)
+        ));
+    }
+}
+#[cfg(test)]
+mod paste_routing_tests {
+    use super::super::{AgentPane, test_fixtures::make_agent};
+    use crate::actions::ActionRegistry;
+    use crate::app::app_view::InputOutcome;
+    use crate::scrollback::ScrollbackSearchState;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    #[test]
+    fn scrollback_search_paste_stays_scoped_and_browse_is_inert() {
+        let mut agent = make_agent();
+        agent.vim_mode = false;
+        agent.set_active_pane(AgentPane::Scrollback, true);
+        agent.prompt.set_text("hidden prompt");
+        agent.scrollback_search = Some(ScrollbackSearchState::open());
+        let registry = ActionRegistry::defaults();
+        let _ = agent.handle_input(&Event::Paste("ab".to_owned()), &registry);
+        let _ = agent.handle_input(
+            &Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            &registry,
+        );
+        let outcome = agent.handle_input(&Event::Paste("中\r\n".to_owned()), &registry);
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert_eq!(
+            agent
+                .scrollback_search
+                .as_ref()
+                .map(ScrollbackSearchState::query),
+            Some("a中b")
+        );
+        assert_eq!(agent.prompt.text(), "hidden prompt");
+        agent.scrollback_search.as_mut().unwrap().accept();
+        let outcome = agent.handle_input(&Event::Paste("ignored".to_owned()), &registry);
+        assert!(matches!(outcome, InputOutcome::Unchanged));
+        assert_eq!(
+            agent
+                .scrollback_search
+                .as_ref()
+                .map(ScrollbackSearchState::query),
+            Some("a中b")
+        );
+        assert_eq!(agent.prompt.text(), "hidden prompt");
+        agent.scrollback_search = None;
+        let outcome = agent.handle_input(&Event::Paste("forwarded".to_owned()), &registry);
+        assert!(matches!(
+            outcome,
+            InputOutcome::ActionThenForward(crate::app::actions::Action::FocusPrompt)
+        ));
+        assert_eq!(agent.prompt.text(), "hidden prompt");
     }
 }
 #[cfg(test)]

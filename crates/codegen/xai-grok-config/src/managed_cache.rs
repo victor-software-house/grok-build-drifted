@@ -175,6 +175,30 @@ fn write_marker_atomically(home: &Path, json: &str) {
     }
 }
 
+/// Whether fail-closed managed policy is armed on disk for `home`.
+///
+/// True when the sync marker records `fail_closed`, on-disk `requirements.toml`
+/// parses as fail_closed, or `requirements.toml` exists but is unreadable
+/// (cannot confirm it is disarmed — must not let `clear_orphan` wipe).
+/// False only when neither the marker nor the file indicates fail_closed
+/// (including when the file is absent / `NotFound`).
+/// Companion to the signed session gate in [`managed_policy_compromised_for`].
+pub fn fail_closed_policy_armed_at(home: &Path) -> bool {
+    if read_managed_config_cache(home).is_some_and(|c| c.fail_closed) {
+        return true;
+    }
+    // Defense in depth: files remain after a stripped/corrupt marker.
+    match std::fs::read_to_string(home.join(crate::loader::REQUIREMENTS_FILENAME)) {
+        Ok(s) => prod_mc_cli_chat_proxy_types::fail_closed_flag_status(&s).is_enabled(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            // File present but unreadable: do not allow clear_orphan to wipe.
+            tracing::warn!("requirements.toml unreadable; treating as fail_closed armed: {e}");
+            true
+        }
+    }
+}
+
 /// The sync marker, or `None` if absent / unreadable / corrupt. Allow-on-unreadable:
 /// a read blip or torn write mustn't lock out a managed user. Unreadable/corrupt are
 /// logged (a corruption-to-disarm isn't silent) and self-heal on the next sync.
@@ -250,8 +274,10 @@ pub fn confirmed_team_switch_at(home: &Path, new_team_id: &str) -> Option<String
 /// True when an artifact the marker recorded serving is now absent. Only served artifacts count, so a config-less
 /// principal (or legacy marker) isn't misread as stale. Detects deletion, not edits.
 fn cache_missing_required_artifact(cache: &ManagedConfigCache, home: &Path) -> bool {
-    (cache.had_requirements && !home.join(crate::loader::REQUIREMENTS_FILENAME).exists())
-        || (cache.had_managed_config && !home.join(crate::loader::MANAGED_CONFIG_FILENAME).exists())
+    use crate::signed_policy::policy_file_has_content;
+    (cache.had_requirements && !policy_file_has_content(home, crate::loader::REQUIREMENTS_FILENAME))
+        || (cache.had_managed_config
+            && !policy_file_has_content(home, crate::loader::MANAGED_CONFIG_FILENAME))
 }
 
 /// Whether the cached principal differs from the team serving now — the team dimension only.
@@ -358,7 +384,7 @@ fn effective_now(cache: Option<&ManagedConfigCache>) -> u64 {
 /// A signing-enabled build over a legacy unsigned / edited / forged or foreign-bound
 /// cache refetches a signed copy; likewise when an imposing claim has no policy
 /// sidecar satisfying it — the states the gate refuses on, so refusal always comes
-/// with a pending self-heal. Dark build or no policy on disk → false.
+/// with a pending self-heal. Keyless build or no policy on disk → false.
 fn signed_cache_needs_refetch(
     home: &Path,
     cache: Option<&ManagedConfigCache>,

@@ -60,6 +60,16 @@ pub struct SamplerConfig {
     /// the URL to derive headers; callers (the session) inject proxy auth
     /// and other access headers here before constructing the config.
     pub extra_headers: IndexMap<String, String>,
+    /// Additional Responses API `include` values not represented by the typed client.
+    #[serde(default)]
+    pub extra_response_includes: Vec<String>,
+    /// Query parameters folded into every request URL (percent-encoded).
+    #[serde(default)]
+    pub query_params: IndexMap<String, String>,
+    /// Header name to environment variable, resolved into request headers at
+    /// client build and never persisted.
+    #[serde(default)]
+    pub env_http_headers: IndexMap<String, String>,
     /// Total context window size in tokens. The sampler does not enforce
     /// it; it is informational metadata used by the session for compaction
     /// decisions.
@@ -113,11 +123,10 @@ pub struct SamplerConfig {
     pub compaction_at_tokens: Option<CompactionAtTokens>,
 
     /// Server-side doom-loop check policy; `None` disables it. When set, the
-    /// client itself sends the opt-in `x-grok-doom-loop-check` header on
-    /// streaming Responses API requests and absorbs the reported trigger
-    /// events (unlike the environment headers in [`Self::extra_headers`],
-    /// this header gates the client's own decode behavior, so it lives with
-    /// the decoder).
+    /// client sends both reporting headers on streaming Responses API requests:
+    /// the configured tail window and the default exact-repetition minimum.
+    /// It also absorbs the reported trigger events (unlike environment headers
+    /// in [`Self::extra_headers`], this gates the client's decode behavior).
     #[serde(default)]
     pub doom_loop_recovery: Option<DoomLoopRecoveryPolicy>,
 
@@ -140,6 +149,9 @@ impl Default for SamplerConfig {
             api_backend: ApiBackend::default(),
             auth_scheme: AuthScheme::default(),
             extra_headers: IndexMap::new(),
+            extra_response_includes: Vec::new(),
+            query_params: IndexMap::new(),
+            env_http_headers: IndexMap::new(),
             context_window: 0,
             force_http1: false,
             max_retries: None,
@@ -184,6 +196,8 @@ pub struct RetryPolicy {
     /// After this many rate-limit (429) retries, escalate to the caller.
     /// Lower than `max_retries` because rate-limit waits can be long.
     pub rate_limit_retry_threshold: u32,
+    #[serde(default)]
+    pub retry_only_before_output: bool,
 }
 
 impl Default for RetryPolicy {
@@ -191,6 +205,7 @@ impl Default for RetryPolicy {
         Self {
             max_retries: DEFAULT_MAX_RETRIES,
             rate_limit_retry_threshold: RATE_LIMIT_RETRY_THRESHOLD,
+            retry_only_before_output: false,
         }
     }
 }
@@ -222,17 +237,18 @@ mod tests {
     #[test]
     fn config_without_doom_loop_recovery_deserializes_to_none() {
         let mut stripped = serde_json::to_value(SamplerConfig::default()).unwrap();
-        stripped
-            .as_object_mut()
-            .unwrap()
-            .remove("doom_loop_recovery");
+        let object = stripped.as_object_mut().unwrap();
+        object.remove("doom_loop_recovery");
+        object.remove("extra_response_includes");
         let config: SamplerConfig = serde_json::from_value(stripped).unwrap();
         assert!(config.doom_loop_recovery.is_none());
+        assert!(config.extra_response_includes.is_empty());
 
         let with_policy = SamplerConfig {
             doom_loop_recovery: Some(DoomLoopRecoveryPolicy {
                 max_threshold: 8,
                 max_retries: 2,
+                ..Default::default()
             }),
             ..Default::default()
         };

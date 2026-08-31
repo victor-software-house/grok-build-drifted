@@ -10,17 +10,30 @@ pub mod conversation;
 pub mod doom_loop;
 pub mod error;
 pub mod messages;
+pub mod provider_error;
 pub mod serde_helpers;
+pub mod tool_overrides;
 pub mod types;
 
 pub use self::conversation::*;
 pub use self::doom_loop::{
-    DOOM_LOOP_CHECK_EVENT_TYPE, DOOM_LOOP_CHECK_HEADER, DoomLoopPeek, DoomLoopRecoveryPolicy,
-    DoomLoopSignal, DoomLoopSignalKind, is_check_event, peek_doom_loop,
+    DEFAULT_EXACT_REPETITION_MIN_TOKENS, DOOM_LOOP_CHECK_EVENT_TYPE, DOOM_LOOP_CHECK_HEADER,
+    DoomLoopPeek, DoomLoopRecoveryPolicy, DoomLoopSignal, DoomLoopSignalKind,
+    EXACT_REPETITION_CHECK_HEADER, is_check_event, peek_doom_loop,
 };
 pub use self::error::{
+<<<<<<< HEAD
     EmptyReason, EmptyResponseContext, ResponseModelMetadata, Result, SamplingError,
     is_context_length_error, status_user_message, user_facing_api_error_message,
+=======
+    ApiErrorCode, EmptyReason, EmptyResponseContext, INVALID_IMAGE_ERROR_CODE,
+    ResponseModelMetadata, Result, SamplingError, SentCredential, is_context_length_error,
+    is_retryable_api_status, parse_error_code, status_user_message, user_facing_api_error_message,
+};
+pub use self::tool_overrides::{
+    ClearableField, MAX_WEB_SEARCH_DOMAINS, SearchDateBound, SearchDateBoundError, ToolOverrides,
+    ToolOverridesUpdate, WebSearchOptions, WebSearchOptionsError, XSearchOptions,
+>>>>>>> bc7f02eddd3d84085849dc19ed216f11c23b0571
 };
 pub use self::types::*;
 

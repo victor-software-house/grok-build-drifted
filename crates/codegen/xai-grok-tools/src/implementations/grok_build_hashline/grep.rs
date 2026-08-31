@@ -133,11 +133,9 @@ fn parse_rg_line(line: &str) -> Option<(usize, char, &str)> {
     Some((num, sep, &line[idx + 1..]))
 }
 
-const DESCRIPTION: &str = r#"Search file contents with anchor-annotated results for use with ${{ tools.by_kind.edit }}.
+const DESCRIPTION: &str = r#"Search file contents with anchor-annotated results${%- if tools.by_kind.edit %} for use with ${{ tools.by_kind.edit }}${%- endif %}.
 
-Match lines include anchors you can pass directly to ${{ tools.by_kind.edit }} without
-needing to ${{ tools.by_kind.read }} the file first. Unlike ${{ tools.by_kind.read }},
-this grep format keeps grep-style separators after the anchor: `:` for
+Match lines include anchors${%- if tools.by_kind.edit %} you can pass directly to ${{ tools.by_kind.edit }}${%- if tools.by_kind.read %} without needing to ${{ tools.by_kind.read }} the file first${%- endif %}${%- endif %}. This grep format keeps grep-style separators after the anchor: `:` for
 match lines and `-` for context lines.
 
 Content output format:
@@ -147,7 +145,11 @@ Content output format:
 
 Usage:
 - ${{ params.search.pattern }} is a regex: `log.*Error`, `function\s+\w+`, `TODO`
+<<<<<<< HEAD
 - Output modes: "content" (default, with anchors), "files_with_matches", "count"
+=======
+- Default output is anchored content matches (no output-mode selector)
+>>>>>>> bc7f02eddd3d84085849dc19ed216f11c23b0571
 - Use -A, -B, -C for context lines around matches
 - Only use '${{ params.search.type }}' or '${{ params.search.glob }}' when certain of the file type
 - Results are capped; truncated results show "at least" counts"#;
@@ -210,7 +212,7 @@ impl xai_tool_runtime::Tool for HashlineGrepTool {
     ) -> xai_tool_types::ToolDescription {
         xai_tool_types::ToolDescription::new(
             "hashline_grep",
-            crate::types::tool_metadata::ToolMetadata::description_template(self),
+            crate::types::tool_metadata::ToolMetadata::sanitized_description_template(self),
         )
     }
 
@@ -347,10 +349,9 @@ mod tests {
     }
 
     #[test]
-    fn description_mentions_anchors_and_edit() {
+    fn description_template_references_edit_tool() {
         use crate::types::tool_metadata::ToolMetadata;
         let tool = HashlineGrepTool;
-        assert!(ToolMetadata::description_template(&tool).contains("anchor"));
         assert!(ToolMetadata::description_template(&tool).contains("tools.by_kind.edit"));
     }
 

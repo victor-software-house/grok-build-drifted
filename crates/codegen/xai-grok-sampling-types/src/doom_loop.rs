@@ -1,8 +1,9 @@
 //! Server-side doom-loop check: wire contract types and tolerant parsers.
 //!
-//! When the client opts in via the `x-grok-doom-loop-check` request header,
-//! the inference API reports detected generation loops on streaming
-//! `/v1/responses` requests in two places:
+//! The inference API reports selected generation-loop detector families on
+//! streaming `/v1/responses` requests: `x-grok-doom-loop-check` selects legacy
+//! labels, while `x-grok-exact-repetition-check` selects exact-repetition
+//! labels. Reports use two places:
 //!
 //! * a non-standard mid-stream SSE event (`response.doom_loop_check`)
 //!   emitted as new triggers appear, carrying the **cumulative** trigger set:
@@ -11,7 +12,8 @@
 //!   object (`response.completed` / `response.incomplete`).
 //!
 //! Triggers are opaque labels with the grammar
-//! `tail_repetition:{threshold}@{channel}` or `low_logprob@{channel}`.
+//! `tail_repetition:{threshold}@{channel}`, `exact_repetition:{tokens}x{copies}@{channel}`,
+//! or `low_logprob@{channel}`.
 //! Presence is itself the detection signal; the set is non-empty when present.
 //!
 //! This module is the single home for that wire shape: if the server contract
@@ -21,8 +23,14 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Request header whose presence enables the server-side check.
+/// Legacy detector reporting header. Its value is the tail/token-diversity
+/// detector window (decimal token count). Exact-repetition labels use the
+/// independent `x-grok-exact-repetition-check` sibling header.
 pub const DOOM_LOOP_CHECK_HEADER: &str = "x-grok-doom-loop-check";
+/// Exact-repetition reporting sibling header. The default client value is the
+/// production-safe 64-token canonical primitive minimum.
+pub const EXACT_REPETITION_CHECK_HEADER: &str = "x-grok-exact-repetition-check";
+pub const DEFAULT_EXACT_REPETITION_MIN_TOKENS: usize = 64;
 
 /// `type` of the non-standard mid-stream SSE event — also its SSE `event:`
 /// name. async-openai's typed `rs::ResponseStreamEvent` does not know this
@@ -61,6 +69,9 @@ pub struct DoomLoopRecoveryPolicy {
     /// Resample budget per turn before accepting the response as-is.
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
+    /// Detector window sent as the value of [`DOOM_LOOP_CHECK_HEADER`].
+    #[serde(default = "default_window_tokens")]
+    pub window_tokens: u32,
 }
 
 fn default_max_threshold() -> u32 {
@@ -69,6 +80,10 @@ fn default_max_threshold() -> u32 {
 
 fn default_max_retries() -> u32 {
     DoomLoopRecoveryPolicy::DEFAULT_MAX_RETRIES
+}
+
+fn default_window_tokens() -> u32 {
+    DoomLoopRecoveryPolicy::DEFAULT_RECOVERY_WINDOW_TOKENS
 }
 
 /// Channel label of the model's thinking stream — the only channel recovery
@@ -80,11 +95,12 @@ impl DoomLoopRecoveryPolicy {
     pub const MAX_THRESHOLD_RANGE: std::ops::RangeInclusive<u32> = 2..=64;
     /// Clamp range for `max_retries`.
     pub const MAX_RETRIES_RANGE: std::ops::RangeInclusive<u32> = 0..=5;
-    /// Default `max_threshold` (lowest common threshold across the backtest
-    /// corpus of confirmed loops).
-    pub const DEFAULT_MAX_THRESHOLD: u32 = 8;
+    pub const DEFAULT_MAX_THRESHOLD: u32 = 64;
     /// Default `max_retries`.
     pub const DEFAULT_MAX_RETRIES: u32 = 2;
+    pub const DEFAULT_RECOVERY_WINDOW_TOKENS: u32 = 1024;
+    /// Inclusive range of `window_tokens` values honored on the wire.
+    pub const WINDOW_TOKENS_RANGE: std::ops::RangeInclusive<u32> = 512..=4096;
 
     /// Clamp a configured `max_threshold` into [`Self::MAX_THRESHOLD_RANGE`].
     pub fn clamp_max_threshold(value: u32) -> u32 {
@@ -100,6 +116,15 @@ impl DoomLoopRecoveryPolicy {
             *Self::MAX_RETRIES_RANGE.start(),
             *Self::MAX_RETRIES_RANGE.end(),
         )
+    }
+
+    /// Out-of-range values fail closed to 4096, not the range floor.
+    pub fn clamp_window_tokens(value: u32) -> u32 {
+        if Self::WINDOW_TOKENS_RANGE.contains(&value) {
+            value
+        } else {
+            4096
+        }
     }
 
     /// A signal this policy treats as a real loop worth acting on: tail
@@ -128,6 +153,7 @@ impl Default for DoomLoopRecoveryPolicy {
         Self {
             max_threshold: Self::DEFAULT_MAX_THRESHOLD,
             max_retries: Self::DEFAULT_MAX_RETRIES,
+            window_tokens: Self::DEFAULT_RECOVERY_WINDOW_TOKENS,
         }
     }
 }
@@ -138,6 +164,12 @@ pub enum DoomLoopSignalKind {
     /// `tail_repetition:{threshold}@{channel}` — a repeating tail was found
     /// at the given detector threshold.
     TailRepetition(u32),
+    /// `exact_repetition:{sequence_tokens}x{repeat_count}@{channel}` — an
+    /// exact token sequence repeated consecutively.
+    ExactRepetition {
+        sequence_tokens: u32,
+        repeat_count: u32,
+    },
     /// `low_logprob@{channel}` — degenerate low-entropy generation.
     LowLogprob,
     /// Any label this client version cannot classify; the unparsed kind
@@ -170,6 +202,18 @@ impl DoomLoopSignal {
                 Ok(t) => DoomLoopSignalKind::TailRepetition(t),
                 Err(_) => DoomLoopSignalKind::Unknown(head.to_string()),
             },
+            Some(("exact_repetition", dimensions)) => dimensions
+                .split_once('x')
+                .and_then(|(sequence, count)| {
+                    Some((sequence.parse::<u32>().ok()?, count.parse::<u32>().ok()?))
+                })
+                .map_or_else(
+                    || DoomLoopSignalKind::Unknown(head.to_string()),
+                    |(sequence_tokens, repeat_count)| DoomLoopSignalKind::ExactRepetition {
+                        sequence_tokens,
+                        repeat_count,
+                    },
+                ),
             None if head == "low_logprob" => DoomLoopSignalKind::LowLogprob,
             _ => DoomLoopSignalKind::Unknown(head.to_string()),
         };
@@ -286,6 +330,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_exact_repetition_label() {
+        let signal = DoomLoopSignal::parse("exact_repetition:42x3@thinking");
+        assert_eq!(
+            signal.kind,
+            DoomLoopSignalKind::ExactRepetition {
+                sequence_tokens: 42,
+                repeat_count: 3,
+            }
+        );
+        assert_eq!(signal.channel, "thinking");
+        assert_eq!(signal.raw, "exact_repetition:42x3@thinking");
+    }
+
+    #[test]
     fn parse_low_logprob_label() {
         let s = DoomLoopSignal::parse("low_logprob@response");
         assert_eq!(s.kind, DoomLoopSignalKind::LowLogprob);
@@ -308,6 +366,10 @@ mod tests {
         // Non-numeric threshold.
         assert!(matches!(
             DoomLoopSignal::parse("tail_repetition:huge@thinking").kind,
+            DoomLoopSignalKind::Unknown(_)
+        ));
+        assert!(matches!(
+            DoomLoopSignal::parse("exact_repetition:bad@thinking").kind,
             DoomLoopSignalKind::Unknown(_)
         ));
         // low_logprob must not carry a threshold segment.
@@ -337,8 +399,9 @@ mod tests {
     #[test]
     fn policy_default_matches_documented_tunables() {
         let p = DoomLoopRecoveryPolicy::default();
-        assert_eq!(p.max_threshold, 8);
+        assert_eq!(p.max_threshold, 64);
         assert_eq!(p.max_retries, 2);
+        assert_eq!(p.window_tokens, 1024);
     }
 
     /// Per-field serde defaults: payloads written before a field existed (or
@@ -350,9 +413,23 @@ mod tests {
         let p: DoomLoopRecoveryPolicy = serde_json::from_str(r#"{"max_threshold":4}"#).unwrap();
         assert_eq!(p.max_threshold, 4);
         assert_eq!(p.max_retries, DoomLoopRecoveryPolicy::DEFAULT_MAX_RETRIES);
+        assert_eq!(
+            p.window_tokens,
+            DoomLoopRecoveryPolicy::DEFAULT_RECOVERY_WINDOW_TOKENS
+        );
         let p: DoomLoopRecoveryPolicy =
             serde_json::from_str(r#"{"max_retries":1,"future_knob":true}"#).unwrap();
         assert_eq!(p.max_retries, 1);
+        assert_eq!(
+            p.window_tokens,
+            DoomLoopRecoveryPolicy::DEFAULT_RECOVERY_WINDOW_TOKENS
+        );
+        let p: DoomLoopRecoveryPolicy = serde_json::from_str(r#"{"window_tokens":4096}"#).unwrap();
+        assert_eq!(p.window_tokens, 4096);
+        assert_eq!(
+            p.max_threshold,
+            DoomLoopRecoveryPolicy::DEFAULT_MAX_THRESHOLD
+        );
     }
 
     /// Pin the server's exact wire bytes (not a paraphrase): the
@@ -443,7 +520,9 @@ mod tests {
         let policy = DoomLoopRecoveryPolicy::default();
         assert!(policy.is_confident(&DoomLoopSignal::parse("tail_repetition:8@thinking")));
         assert!(policy.is_confident(&DoomLoopSignal::parse("tail_repetition:2@thinking")));
-        assert!(!policy.is_confident(&DoomLoopSignal::parse("tail_repetition:9@thinking")));
+        assert!(policy.is_confident(&DoomLoopSignal::parse("tail_repetition:32@thinking")));
+        assert!(policy.is_confident(&DoomLoopSignal::parse("tail_repetition:64@thinking")));
+        assert!(!policy.is_confident(&DoomLoopSignal::parse("tail_repetition:65@thinking")));
         assert!(!policy.is_confident(&DoomLoopSignal::parse("tail_repetition:2@response")));
         assert!(!policy.is_confident(&DoomLoopSignal::parse("low_logprob@thinking")));
         assert!(!policy.is_confident(&DoomLoopSignal::parse("novel_detector:2@thinking")));

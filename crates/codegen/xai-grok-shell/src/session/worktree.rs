@@ -32,11 +32,13 @@ impl From<WorktreeType> for ShellWorktreeType {
 ///
 /// When `git_ref` is set, forces a clean checkout of that ref (same as the
 /// manual `create_from_worktree_sync` path used by `grok -w --ref`).
+#[tracing::instrument(skip_all)]
 async fn create_worktree_for_resume(
     source_cwd: &str,
     copy_mode: WorktreeCopyMode,
     worktree_type: ShellWorktreeType,
     git_ref: Option<String>,
+    grove_worktree: Option<bool>,
 ) -> Result<CreateWorktreeFromWorktreeResponse> {
     let copy_mode = if git_ref.is_some() {
         WorktreeCopyMode::Clean
@@ -50,6 +52,7 @@ async fn create_worktree_for_resume(
         git_ref,
         worktree_type: Some(WorktreeType::from(worktree_type)),
         label: None,
+        grove_worktree,
         cancellation_token: None,
         resolved_dest_path: None,
     };
@@ -63,7 +66,22 @@ async fn create_worktree_for_resume(
         create_worktree_from_worktree_sync(&wt_req).await
     }
 }
+/// `remove_worktree` already tried daemon unmount. `rm -rf` is only safe when
+/// dest is known-unmounted; a projected or inconclusive dest must not be walked.
+async fn fallback_rm_dir_all_after_failed_remove(wt: &Path, err: &impl std::fmt::Display) {
+    if !xai_fast_worktree::dest_is_known_unmounted(wt) {
+        tracing::warn!(
+            error = %err,
+            path = %wt.display(),
+            "remove_worktree failed during cleanup; dest is mounted or mount table inconclusive, skipping rm"
+        );
+        return;
+    }
+    tracing::warn!(error = %err, "fast remove_worktree failed during cleanup, trying rm");
+    let _ = tokio::fs::remove_dir_all(wt).await;
+}
 /// Best-effort cleanup of a worktree created during a failed resume flow.
+#[tracing::instrument(skip_all)]
 async fn cleanup_worktree_on_failure(source_cwd: &str, worktree_path: &str) {
     let wt = std::path::Path::new(worktree_path);
     if !wt.exists() {
@@ -74,7 +92,7 @@ async fn cleanup_worktree_on_failure(source_cwd: &str, worktree_path: &str) {
         .is_some_and(|root| xai_grok_workspace::session::git::detect_vcs_kind(&root).is_jj());
     if is_jj {
         if let Err(e) = remove_jj_workspace(worktree_path).await {
-            tracing::warn!(error = % e, "failed to clean up jj workspace after failure");
+            tracing::warn!(error = %e, "failed to clean up jj workspace after failure");
         }
     } else {
         let wt_path = wt.to_path_buf();
@@ -83,21 +101,18 @@ async fn cleanup_worktree_on_failure(source_cwd: &str, worktree_path: &str) {
         {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => {
-                tracing::warn!(
-                    error = % e, "fast remove_worktree failed during cleanup, trying rm"
-                );
-                let _ = tokio::fs::remove_dir_all(wt).await;
+                fallback_rm_dir_all_after_failed_remove(wt, &e).await;
             }
             Err(e) => {
-                tracing::warn!(
-                    error = % e,
-                    "remove_worktree task panicked during cleanup, trying rm"
-                );
-                let _ = tokio::fs::remove_dir_all(wt).await;
+                fallback_rm_dir_all_after_failed_remove(wt, &e).await;
             }
         }
         if let Ok(root) = find_git_root_from_path(std::path::Path::new(source_cwd)) {
-            let _ = xai_grok_workspace::session::git::git_cli(&root, &["worktree", "prune"]).await;
+            let wt_path = wt.to_path_buf();
+            let _ = tokio::task::spawn_blocking(move || {
+                xai_fast_worktree::remove_stale_worktree_registration(&root, &wt_path)
+            })
+            .await;
         }
     }
 }
@@ -147,7 +162,7 @@ pub(crate) fn build_worktree_restore_outcome(
 use crate::session::persistence::{ResolvedLocalSession, resolve_local_session_for_repo};
 /// Combined backend helper: resolve a session across all worktree roots
 /// belonging to the same repo as `current_cwd`.
-pub fn resolve_session_repo_wide(
+pub(crate) fn resolve_session_repo_wide(
     session_id: &str,
     current_cwd: &std::path::Path,
 ) -> Result<Option<ResolvedLocalSession>> {
@@ -155,12 +170,19 @@ pub fn resolve_session_repo_wide(
     let refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
     Ok(resolve_local_session_for_repo(session_id, &refs))
 }
+/// Whether remote worktree resume should fetch/apply the repository snapshot.
+pub(crate) fn remote_worktree_restores_codebase(
+    restore_code: Option<bool>,
+    restore_code_default: bool,
+) -> bool {
+    restore_code.unwrap_or(restore_code_default)
+}
 /// Orchestrate the full "resume session in worktree" flow.
 ///
 /// Shell-side orchestration: composes client ops (session persistence,
 /// auth, registry) with server ops (worktree creation, git, fetch+extract)
 /// dispatched through `WorkspaceOps`.
-pub async fn resume_session_in_worktree(
+pub(crate) async fn resume_session_in_worktree(
     req: &ResumeSessionInWorktreeRequest,
     ops: &xai_grok_workspace::WorkspaceOps,
     worktree_type_default: ShellWorktreeType,
@@ -168,20 +190,25 @@ pub async fn resume_session_in_worktree(
     registry_client: Option<&crate::agent::session_registry_client::SessionRegistryClient>,
     auth_manager: Option<std::sync::Arc<crate::auth::AuthManager>>,
     agent_id: &str,
+    grove_worktree: Option<bool>,
 ) -> Result<ResumeSessionInWorktreeResponse> {
     use xai_grok_workspace::session::git::effective_worktree_path;
     tracing::info!(
-        target : WORKTREE_LOG, session_id = % req.session_id, restore_code = ? req
-        .restore_code, restore_code_default, effective_restore_code = req.restore_code
-        .unwrap_or(restore_code_default),
+        target: WORKTREE_LOG,
+        session_id = %req.session_id,
+        restore_code = ?req.restore_code,
+        restore_code_default,
+        effective_restore_code = req.restore_code.unwrap_or(restore_code_default),
         "RESTORE_CODE_DEBUG: resume_session_in_worktree entry"
     );
     let cwd_path = std::path::Path::new(req.source_cwd.as_str());
     let local_resolution = resolve_session_repo_wide(&req.session_id, cwd_path);
     if let Ok(Some(resolved)) = local_resolution {
         tracing::info!(
-            target : WORKTREE_LOG, session_id = % req.session_id, resolved_cwd = %
-            resolved.cwd, kind = ? resolved.resolution_kind,
+            target: WORKTREE_LOG,
+            session_id = %req.session_id,
+            resolved_cwd = %resolved.cwd,
+            kind = ?resolved.resolution_kind,
             "RESUME_LOCAL_RESOLVED: session found via repo-wide lookup"
         );
         return resume_local_session_in_worktree(
@@ -194,6 +221,7 @@ pub async fn resume_session_in_worktree(
             registry_client,
             auth_manager,
             agent_id,
+            grove_worktree,
         )
         .await;
     }
@@ -205,7 +233,7 @@ pub async fn resume_session_in_worktree(
         )
     })?;
     tracing::info!(
-        session_id = % req.session_id,
+        session_id = %req.session_id,
         "Restoring remote session: creating worktree first to keep source clean"
     );
     let worktree_type = req
@@ -217,6 +245,7 @@ pub async fn resume_session_in_worktree(
         req.copy_mode,
         worktree_type,
         req.git_ref.clone(),
+        grove_worktree,
     )
     .await?;
     let record = client
@@ -224,6 +253,7 @@ pub async fn resume_session_in_worktree(
         .await
         .context("fetching session record for remote restore")?;
     let turn = crate::session::restore::resolve_restore_turn(&record, None);
+    let restore_code = remote_worktree_restores_codebase(req.restore_code, restore_code_default);
     let memory_dl_future = crate::session::restore::download_to_tempfile(
         client,
         &req.session_id,
@@ -235,7 +265,10 @@ pub async fn resume_session_in_worktree(
             "session-state archive restore unavailable in this build"
         ))
     };
-    let (memory_dl, state_dl) = tokio::join!(memory_dl_future, state_dl_future);
+    let (memory_dl, state_dl) = {
+        let _ = restore_code;
+        tokio::join!(memory_dl_future, state_dl_future)
+    };
     let codebase_ok = false;
     let _memory_result =
         crate::session::restore::apply_memory_download(memory_dl, &wt_resp.worktree_path).await;
@@ -249,7 +282,7 @@ pub async fn resume_session_in_worktree(
     if session_state_result.is_skipped() {
         cleanup_worktree_on_failure(&req.source_cwd, &wt_resp.worktree_path).await;
         anyhow::bail!(
-            "Session {} restored codebase but session-state archive was unavailable -- \
+            "Session {} session-state archive was unavailable -- \
              conversation history cannot be recovered. Retry in a few moments.",
             req.session_id,
         );
@@ -294,6 +327,7 @@ async fn resume_local_session_in_worktree(
     registry_client: Option<&crate::agent::session_registry_client::SessionRegistryClient>,
     auth_manager: Option<std::sync::Arc<crate::auth::AuthManager>>,
     agent_id: &str,
+    grove_worktree: Option<bool>,
 ) -> Result<ResumeSessionInWorktreeResponse> {
     use crate::session::fork::{ForkSessionRequest, fork_session};
     use xai_grok_workspace::session::git::effective_worktree_path;
@@ -306,13 +340,17 @@ async fn resume_local_session_in_worktree(
         req.copy_mode,
         worktree_type,
         req.git_ref.clone(),
+        grove_worktree,
     )
     .await?;
     tracing::info!(
-        target : WORKTREE_LOG, restore_code = ? req.restore_code, restore_code_default,
-        effective = req.restore_code.unwrap_or(restore_code_default), git_ref = req
-        .git_ref.as_deref(), resolved_session_id, worktree_path = % wt_resp
-        .worktree_path,
+        target: WORKTREE_LOG,
+        restore_code = ?req.restore_code,
+        restore_code_default,
+        effective = req.restore_code.unwrap_or(restore_code_default),
+        git_ref = req.git_ref.as_deref(),
+        resolved_session_id,
+        worktree_path = %wt_resp.worktree_path,
         "RESTORE_CODE_DEBUG: resume_local_session_in_worktree, about to check restore_code"
     );
     let mut decision = WorktreeRestoreDecision {
@@ -345,8 +383,9 @@ async fn resume_local_session_in_worktree(
                 })
                 .and_then(|s| s.head_commit);
             tracing::info!(
-                target : WORKTREE_LOG, head_commit = ? head_commit, summary_path = %
-                summary_path.display(),
+                target: WORKTREE_LOG,
+                head_commit = ?head_commit,
+                summary_path = %summary_path.display(),
                 "RESTORE_CODE_DEBUG: loaded head_commit from summary"
             );
             let outcome = checkout_persisted_head_in_worktree(
@@ -412,7 +451,7 @@ async fn resume_local_session_in_worktree(
 /// Orchestrate session rehydration: recreate the git worktree at the exact
 /// path and restore all session state using the original session ID.
 ///
-pub async fn rehydrate_session_in_worktree(
+pub(crate) async fn rehydrate_session_in_worktree(
     req: &RehydrateSessionRequest,
     #[allow(unused_variables)] ops: &xai_grok_workspace::WorkspaceOps,
     registry_client: Option<&crate::agent::session_registry_client::SessionRegistryClient>,
@@ -433,7 +472,8 @@ pub async fn rehydrate_session_in_worktree(
         .exists();
     if worktree_path.exists() && session_summary_exists {
         tracing::info!(
-            session_id = % req.session_id, worktree_path = % worktree_path_str,
+            session_id = %req.session_id,
+            worktree_path = %worktree_path_str,
             "rehydrate: worktree and session state already exist, skipping"
         );
         return Ok(RehydrateSessionResponse {
@@ -447,10 +487,7 @@ pub async fn rehydrate_session_in_worktree(
         });
     }
     if !worktree_path.exists() {
-        tracing::info!(
-            session_id = % req.session_id, % worktree_path_str,
-            "rehydrate: creating worktree"
-        );
+        tracing::info!(session_id = %req.session_id, %worktree_path_str, "rehydrate: creating worktree");
         if let Some(parent) = worktree_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -529,6 +566,27 @@ pub async fn rehydrate_session_in_worktree(
 mod tests {
     use super::*;
     use serial_test::serial;
+    #[tokio::test]
+    async fn fallback_rm_dir_all_skips_when_dest_not_known_unmounted() {
+        let root = Path::new("/");
+        if xai_fast_worktree::dest_is_known_unmounted(root) {
+            return;
+        }
+        fallback_rm_dir_all_after_failed_remove(root, &"test").await;
+        assert!(root.exists(), "must not rm a live or inconclusive dest");
+    }
+    #[tokio::test]
+    async fn fallback_rm_dir_all_removes_known_unmounted_dest() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dest = tmp.path().join("leftover");
+        std::fs::create_dir(&dest).unwrap();
+        assert!(xai_fast_worktree::dest_is_known_unmounted(&dest));
+        fallback_rm_dir_all_after_failed_remove(&dest, &"test").await;
+        assert!(
+            !dest.exists(),
+            "known-unmounted copy dest should be removed"
+        );
+    }
     #[test]
     fn resume_request_deserializes_with_defaults() {
         let json = r#"{"sessionId":"s1","sourceCwd":"/project"}"#;
@@ -891,6 +949,13 @@ mod tests {
             LocalSessionResolutionKind::SameRepoDifferentCwd
         );
     }
+    #[test]
+    fn remote_worktree_codebase_follows_request_then_default() {
+        assert!(!remote_worktree_restores_codebase(Some(false), true));
+        assert!(!remote_worktree_restores_codebase(None, false));
+        assert!(remote_worktree_restores_codebase(None, true));
+        assert!(remote_worktree_restores_codebase(Some(true), false));
+    }
     #[tokio::test]
     async fn resume_in_worktree_falls_through_to_remote_when_not_found_locally() {
         let req = ResumeSessionInWorktreeRequest {
@@ -910,6 +975,7 @@ mod tests {
             None,
             None,
             "test-agent",
+            None,
         )
         .await;
         let err = result.expect_err("should fail when session not found and no registry");
@@ -965,6 +1031,7 @@ mod tests {
             WorktreeCopyMode::Clean,
             ShellWorktreeType::Linked,
             None,
+            None,
         )
         .await
         .expect("worktree creation should succeed");
@@ -1005,6 +1072,7 @@ mod tests {
             WorktreeCopyMode::Dirty,
             ShellWorktreeType::Linked,
             Some("main".into()),
+            None,
         )
         .await
         .expect("worktree creation with git_ref should succeed");
@@ -1032,6 +1100,7 @@ mod tests {
             &source_cwd,
             WorktreeCopyMode::Clean,
             ShellWorktreeType::Linked,
+            None,
             None,
         )
         .await

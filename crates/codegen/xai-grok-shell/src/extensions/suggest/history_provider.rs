@@ -19,7 +19,7 @@ const MAX_RESULTS: usize = 10;
 pub(crate) struct HistoryProvider;
 
 impl HistoryProvider {
-    pub async fn suggest(&self, ctx: &SuggestContext) -> Vec<RankedSuggestion> {
+    pub(crate) async fn suggest(&self, ctx: &SuggestContext) -> Vec<RankedSuggestion> {
         let prefix = ctx.prefix();
         if prefix.is_empty() {
             return Vec::new();
@@ -256,7 +256,7 @@ fn load_shell_history() -> Vec<String> {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    xai_dirs::home_dir()
 }
 
 /// Keep only the most recent `max` entries, reverse to most-recent-first, and

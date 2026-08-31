@@ -1,12 +1,8 @@
 #![cfg_attr(rustfmt, rustfmt::skip)]
     use super::*;
 
-    /// Regression: a shared-queue interjection renders only via the broadcast,
-    /// and the shell emits the queue-emptying `x.ai/queue/changed` right after
-    /// it — which used to fire the withheld parked marker BELOW the just-
-    /// rendered user message ("Worked for …" under the follow-up, flipped
-    /// transcript order). The broadcast must consume the marker slot instead.
     #[test]
+<<<<<<< HEAD
     fn interjection_broadcast_mid_park_forgoes_parked_marker() {
         use crate::app::agent_view::test_fixtures::{count_parked, simulate_task_output_wait};
 
@@ -48,6 +44,10 @@
     #[test]
     fn forgone_slot_suppresses_later_marker_pushes() {
         use crate::app::agent_view::test_fixtures::{count_parked, simulate_task_output_wait};
+=======
+    fn interjection_broadcast_mid_park_adds_no_marker() {
+        use crate::app::agent_view::test_fixtures::{count_turn_markers, simulate_task_output_wait};
+>>>>>>> bc7f02eddd3d84085849dc19ed216f11c23b0571
 
         let mut app = make_app_with_agent("sess-park");
         {
@@ -57,32 +57,53 @@
             insert_running_task(agent, "t10", "sleep 10");
             insert_running_task(agent, "t15", "sleep 15");
             simulate_task_output_wait(agent, "t15");
-            // The parked drain interjected a queued row before the marker
-            // became eligible: slot consumed WITHOUT a marker.
-            agent.suppress_parked_marker_on_interject();
-            assert!(agent.renders_parked(), "forgone slot keeps parked chrome");
-            assert_eq!(count_parked(agent), 0, "no marker on screen");
+            assert!(agent.is_parked_on_sendable_wait());
+            assert_eq!(count_turn_markers(agent), 0, "the park writes no row");
         }
 
-        // A task completing in the still-parked window must stay silent.
+        assert!(handle_ext_notification(
+            &interjection_broadcast("sess-park", "queued follow-up"),
+            &mut app,
+        ));
+
+        {
+            let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+            assert_eq!(
+                last_interjection_text(&agent.scrollback).as_deref(),
+                Some("queued follow-up"),
+            );
+            assert_eq!(
+                count_turn_markers(agent),
+                0,
+                "no 'Worked for …' marker around the interjection"
+            );
+        }
+
         handle_ext_notification(
             &make_task_completed_notif("sess-park", "t10", "sleep 10", Some(0)),
             &mut app,
         );
         let agent = app.agents.get_mut(&AgentId(0)).unwrap();
         assert_eq!(
-            count_parked(agent),
+            count_turn_markers(agent),
             0,
             "no 'Worked for …' tick under the interjection"
         );
+        assert!(agent.renders_parked(), "the parked chrome stays on");
     }
 
+<<<<<<< HEAD
     /// "sleep 10, 15, 20 in the background": completions within one park
     /// episode push chips only — the marker never re-pushes. (Elapsed
     /// renders as "0.0s": `turn_started_at` is unset in this fixture.)
     #[test]
     fn parked_completions_push_chips_without_marker_repush() {
         use crate::app::agent_view::test_fixtures::simulate_task_output_wait;
+=======
+    #[test]
+    fn parked_completions_push_chips_without_markers() {
+        use crate::app::agent_view::test_fixtures::{count_turn_markers, simulate_task_output_wait};
+>>>>>>> bc7f02eddd3d84085849dc19ed216f11c23b0571
 
         let mut app = make_app_with_agent("sess-park");
         {
@@ -93,17 +114,19 @@
             insert_running_task(agent, "t15", "sleep 15");
             insert_running_task(agent, "t20", "sleep 20");
             simulate_task_output_wait(agent, "t20");
-            agent.maybe_push_parked_marker();
             assert!(agent.renders_parked());
         }
 
+<<<<<<< HEAD
         // Each completion lands as a chip; no marker re-push, no "N commands
         // still running." lines.
+=======
+>>>>>>> bc7f02eddd3d84085849dc19ed216f11c23b0571
         handle_ext_notification(
             &make_task_completed_notif("sess-park", "t10", "sleep 10", Some(0)),
             &mut app,
         );
-        // Duplicate completion for the same task: not a Running→Done edge.
+        // Duplicate completion for the same task: not a Running-to-Done edge
         handle_ext_notification(
             &make_task_completed_notif("sess-park", "t10", "sleep 10", Some(0)),
             &mut app,
@@ -119,6 +142,7 @@
 
         let agent = app.agents.get_mut(&AgentId(0)).unwrap();
         assert_eq!(
+<<<<<<< HEAD
             parked_marker_messages(agent),
             vec!["Worked for 0.0s".to_string()],
             "one plain marker per park episode — completions never re-push"
@@ -444,164 +468,65 @@
         agent.maybe_push_parked_marker();
 
         assert_eq!(count_parked(agent), 0, "imminent wait must not park");
-        assert!(
-            agent.parked_wait_marker_for.is_none(),
-            "slot must stay free for a later genuine park"
+=======
+            count_turn_markers(agent),
+            0,
+            "completions during a park never write a marker"
         );
-        assert!(!agent.renders_parked());
+>>>>>>> bc7f02eddd3d84085849dc19ed216f11c23b0571
+        assert!(
+            work_status_lines(&agent.scrollback).is_empty(),
+            "no work-only status lines in the transcript"
+        );
     }
 
-    /// A skipped wait leaves the slot free: a later wait on running work in
-    /// the same turn still parks.
     #[test]
-    fn later_genuine_wait_still_parks_after_imminent_wait_skip() {
-        use crate::app::agent_view::test_fixtures::{
-            complete_task_output_wait_call, count_parked, simulate_task_output_wait_call,
-        };
+    fn consecutive_subagent_finishes_stay_markerless() {
+        use crate::app::agent_view::test_fixtures::count_turn_markers;
 
         let mut app = make_app_with_agent("sess-park");
+        {
+            let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+            park_on_subagents(agent, &["child-1", "child-2", "child-3"]);
+        }
+
+        for child in ["child-1", "child-1", "child-2", "child-3"] {
+            handle(
+                make_ext_session_notification("sess-park", test_subagent_finished(child)),
+                &mut app,
+            );
+        }
         let agent = app.agents.get_mut(&AgentId(0)).unwrap();
-        agent.session.state = AgentState::TurnRunning;
-        agent.session.current_prompt_id = Some("p1".into());
-        insert_running_task(agent, "done", "sleep 1");
-        agent.session.bg_tasks.get_mut("done").unwrap().status = BgTaskStatus::Done;
-
-        simulate_task_output_wait_call(agent, "wait-1", "done", 30_000);
-        agent.maybe_push_parked_marker();
-        assert_eq!(count_parked(agent), 0);
-
-        complete_task_output_wait_call(agent, "wait-1");
-        insert_running_task(agent, "live", "sleep 99");
-        simulate_task_output_wait_call(agent, "wait-2", "live", 30_000);
-        agent.maybe_push_parked_marker();
-
-        assert_eq!(count_parked(agent), 1, "genuine park still renders");
         assert_eq!(
+<<<<<<< HEAD
             parked_marker_messages(agent),
             vec!["Worked for 0.0s".to_string()],
+=======
+            count_turn_markers(agent),
+            0,
+            "subagent finishes never write a marker mid-park"
+>>>>>>> bc7f02eddd3d84085849dc19ed216f11c23b0571
         );
     }
 
-    /// `Failed` is terminal for imminence, not just `Done`.
     #[test]
-    fn wait_on_failed_task_pushes_no_parked_marker() {
-        use crate::app::agent_view::test_fixtures::{count_parked, simulate_task_output_wait};
-
-        let mut app = make_app_with_agent("sess-park");
-        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
-        agent.session.state = AgentState::TurnRunning;
-        agent.session.current_prompt_id = Some("p1".into());
-        insert_running_task(agent, "t10", "sleep 10");
-        agent.session.bg_tasks.get_mut("t10").unwrap().status = BgTaskStatus::Failed;
-
-        simulate_task_output_wait(agent, "t10");
-        agent.maybe_push_parked_marker();
-
-        assert_eq!(count_parked(agent), 0, "failed task wait must not park");
-        assert!(agent.parked_wait_marker_for.is_none());
-    }
-
-    /// Finished-subagent waits do not park — resolved by subagent id, then by
-    /// child session id.
-    #[test]
-    fn wait_on_finished_subagent_pushes_no_parked_marker() {
+    fn repark_after_parent_output_stays_markerless() {
+        use crate::acp::meta::NotificationMeta;
         use crate::app::agent_view::test_fixtures::{
-            complete_task_output_wait_call, count_parked, simulate_task_output_wait_call,
+            complete_task_output_wait_call, count_turn_markers, simulate_task_output_wait_call,
         };
 
         let mut app = make_app_with_agent("sess-park");
         let agent = app.agents.get_mut(&AgentId(0)).unwrap();
         agent.session.state = AgentState::TurnRunning;
         agent.session.current_prompt_id = Some("p1".into());
-        let mut info = make_subagent_info("child-1");
-        info.finished = true;
-        agent.subagent_sessions.insert("child-1".into(), info);
-
-        simulate_task_output_wait_call(agent, "wait-1", "sa-child-1", 30_000);
-        agent.maybe_push_parked_marker();
-        assert_eq!(count_parked(agent), 0, "finished subagent wait must not park");
-        assert!(agent.parked_wait_marker_for.is_none());
-
-        complete_task_output_wait_call(agent, "wait-1");
-        simulate_task_output_wait_call(agent, "wait-2", "child-1", 30_000);
-        agent.maybe_push_parked_marker();
-        assert_eq!(count_parked(agent), 0, "child-session-id wait must not park");
-        assert!(agent.parked_wait_marker_for.is_none());
-    }
-
-    /// One unresolvable id among terminal ones keeps the park.
-    #[test]
-    fn wait_including_unknown_id_still_parks() {
-        use crate::acp::meta::NotificationMeta;
-        use crate::app::agent_view::test_fixtures::count_parked;
-
-        let mut app = make_app_with_agent("sess-park");
-        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
-        agent.session.state = AgentState::TurnRunning;
-        agent.session.current_prompt_id = Some("p1".into());
-        insert_running_task(agent, "done", "sleep 1");
-        agent.session.bg_tasks.get_mut("done").unwrap().status = BgTaskStatus::Done;
-
-        let meta = NotificationMeta::default();
-        agent.session.handle_update(
-            acp::SessionUpdate::ToolCall(
-                acp::ToolCall::new(
-                    acp::ToolCallId::new(std::sync::Arc::from("wait-1")),
-                    "get_command_or_subagent_output",
-                )
-                .kind(acp::ToolKind::Other)
-                .status(acp::ToolCallStatus::Pending)
-                .content(vec![])
-                .locations(vec![]),
-            ),
-            &meta,
-            &mut agent.scrollback,
-        );
-        agent.session.handle_update(
-            acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
-                acp::ToolCallId::new(std::sync::Arc::from("wait-1")),
-                acp::ToolCallUpdateFields::new().raw_input(Some(serde_json::json!({
-                    "task_ids": ["done", "not-ours"],
-                    "timeout_ms": 30_000,
-                }))),
-            )),
-            &meta,
-            &mut agent.scrollback,
-        );
-        agent.maybe_push_parked_marker();
-
-        assert_eq!(count_parked(agent), 1, "unresolvable id keeps the park");
-    }
-
-    #[test]
-    fn wait_all_with_zero_work_pushes_no_parked_marker() {
-        use crate::app::agent_view::test_fixtures::{count_parked, simulate_wait_all};
-
-        let mut app = make_app_with_agent("sess-park");
-        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
-        agent.session.state = AgentState::TurnRunning;
-        agent.session.current_prompt_id = Some("p1".into());
-
-        simulate_wait_all(agent);
-        agent.maybe_push_parked_marker();
-
-        assert_eq!(count_parked(agent), 0, "zero-work wait-all must not park");
-        assert!(agent.parked_wait_marker_for.is_none());
-    }
-
-    #[test]
-    fn wait_all_with_running_work_still_parks() {
-        use crate::app::agent_view::test_fixtures::{count_parked, simulate_wait_all};
-
-        let mut app = make_app_with_agent("sess-park");
-        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
-        agent.session.state = AgentState::TurnRunning;
-        agent.session.current_prompt_id = Some("p1".into());
         insert_running_task(agent, "t10", "sleep 10");
 
-        simulate_wait_all(agent);
-        agent.maybe_push_parked_marker();
+        simulate_task_output_wait_call(agent, "wait-1", "t10", 30_000);
+        assert!(agent.renders_parked());
+        assert_eq!(count_turn_markers(agent), 0);
 
+<<<<<<< HEAD
         assert_eq!(count_parked(agent), 1, "wait-all on live work parks");
         assert_eq!(
             parked_marker_messages(agent),
@@ -672,13 +597,26 @@
             parked_marker_messages(agent),
             vec!["Worked for 0.0s".to_string()],
         );
+=======
+        complete_task_output_wait_call(agent, "wait-1");
+        assert!(agent.session.tracker.handle_update(
+            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                acp::ContentBlock::Text(acp::TextContent::new("between-parks content")),
+            )),
+            &NotificationMeta::default(),
+            &mut agent.scrollback,
+        ));
+
+        simulate_task_output_wait_call(agent, "wait-2", "t10", 30_000);
+        assert!(agent.renders_parked(), "the re-park renders parked again");
+        assert_eq!(count_turn_markers(agent), 0, "and still writes no marker");
+>>>>>>> bc7f02eddd3d84085849dc19ed216f11c23b0571
     }
 
     #[test]
     fn interjection_notification_pushes_block_to_matching_session() {
-        // Multi-client fix: an interjection typed in one pane is broadcast by
-        // the shell as x.ai/session/interjection; EVERY attached pane (incl.
-        // the originator, which no longer pushes a local block) renders it.
+        // Multi-client: an interjection typed in one pane is broadcast by the shell as x.ai/session/interjection
+        // EVERY attached pane (incl. the originator, which no longer pushes a local block) renders it.
         let mut app = make_app_with_agent("sess-view");
         let affected =
             handle_ext_notification(&interjection_ext("sess-view", "also add tests"), &mut app);
@@ -707,8 +645,7 @@
 
     #[test]
     fn interjection_notification_renders_for_a_viewer() {
-        // A viewer (attached_as_viewer) watching another client's session must
-        // also render interjections broadcast for that session.
+        // A viewer (attached_as_viewer) watching another client's session must also render interjections broadcast for that session
         let mut app = make_app_with_agent("sess-view");
         app.agents.get_mut(&AgentId(0)).unwrap().attached_as_viewer = true;
         let affected =
@@ -724,9 +661,8 @@
 
     #[test]
     fn interjection_notification_dedups_originators_own_echo() {
-        // The originator rendered an optimistic block in dispatch_interject and
-        // recorded the id; its own broadcast echo must be dropped (no dup) and
-        // the id forgotten.
+        // The originator rendered an optimistic block in dispatch_interject and recorded the id
+        // Its own broadcast echo must be dropped (no dup) and the id forgotten
         let mut app = make_app_with_agent("sess-view");
         app.agents
             .get_mut(&AgentId(0))
@@ -754,9 +690,31 @@
     }
 
     #[test]
+    fn goal_send_now_notification_claims_optimistic_prompt_block() {
+        let mut app = make_app_with_agent("sess-view");
+        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+        agent.note_self_originated_prompt("prompt-1");
+        let entry_id = agent
+            .scrollback
+            .push_block(RenderBlock::user_prompt("steer the goal".to_string()));
+        agent
+            .send_now_painted_blocks
+            .insert("prompt-1".to_string(), (entry_id, false));
+
+        let affected = handle_ext_notification(
+            &interjection_ext_with_id("sess-view", "steer the goal", Some("prompt-1")),
+            &mut app,
+        );
+        assert!(!affected, "the optimistic block already represents the message");
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(!agent.send_now_painted_blocks.contains_key("prompt-1"));
+        assert!(agent.expect_send_now_cancel.is_none());
+        assert_eq!(last_interjection_text(&agent.scrollback).as_deref(), Some("steer the goal"));
+    }
+
+    #[test]
     fn interjection_notification_with_foreign_id_renders() {
-        // A broadcast carrying an id this client did NOT mint (another pane's
-        // interjection) must render — only the originator dedups by its own id.
+        // A broadcast carrying an id this client did NOT mint (another pane's interjection) must render; only the originator dedups by its own id
         let mut app = make_app_with_agent("sess-view");
         let affected = handle_ext_notification(
             &interjection_ext_with_id("sess-view", "from another pane", Some("other-id")),
@@ -770,4 +728,3 @@
             "an interjection from another pane must render"
         );
     }
-
