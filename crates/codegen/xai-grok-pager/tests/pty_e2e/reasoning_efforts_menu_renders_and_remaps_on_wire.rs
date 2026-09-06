@@ -2,14 +2,14 @@
 #[allow(unused_imports)]
 use super::common::*;
 
-/// Server-driven reasoning-effort menu: a model carrying a `reasoning_efforts`
-/// list renders the server labels in `/effort`, and selecting a remap row sends
-/// the mapped canonical value on the wire (`deep` → `xhigh`).
+/// Server-driven reasoning-effort menu: a model carrying a `reasoning_efforts` list renders the server labels in `/effort`.
+/// Selecting a remap row sends the mapped canonical value on the wire (`deep` maps to `xhigh`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn reasoning_efforts_menu_renders_and_remaps_on_wire() {
     let content = ContentController::start_with_models(vec![
         MockModel::new("grok-4.5")
+            .with_api_backend("responses")
             .with_supports_reasoning_effort(true)
             .with_reasoning_efforts(vec![
                 json!({ "id": "deep", "value": "xhigh", "label": "Deep", "description": "Maximum reasoning" }),
@@ -37,8 +37,7 @@ async fn reasoning_efforts_menu_renders_and_remaps_on_wire() {
         .wait_for_text(MOCK_RESPONSE_SENTINEL, Duration::from_secs(30))
         .expect("first turn rendered");
 
-    // (A) The server's custom label renders in the `/effort` dropdown, and the
-    // built-in rows are replaced (their descriptions must be absent).
+    // (A) The server's custom label renders in the `/effort` dropdown, and the built-in rows are replaced (their descriptions must be absent)
     inject_keys_paced(&mut harness, b"/effort ");
     harness
         .wait_for_text("Deep", Duration::from_secs(10))

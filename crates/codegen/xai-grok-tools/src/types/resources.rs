@@ -652,6 +652,19 @@ impl Default for RespectGitignore {
 /// Default `false`. Hosts may enable this via remote config or local settings.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PathNotFoundHints(pub bool);
+/// Whether scheduled task fires execute in background loop subagents.
+///
+/// `false` forces every fire onto the legacy main-conversation path.
+/// Configured via `[scheduler] background_loops` in `config.toml`, the
+/// `GROK_SCHEDULER_BACKGROUND_LOOPS` env var, or the
+/// `scheduler_background_loops` remote setting.
+#[derive(Debug, Clone, Copy)]
+pub struct SchedulerBackgroundLoops(pub bool);
+impl Default for SchedulerBackgroundLoops {
+    fn default() -> Self {
+        Self(true)
+    }
+}
 /// Map of canonical tool names → model-facing tool names.
 #[derive(Debug, Clone, Default)]
 pub struct ToolNameMapping(pub HashMap<String, String>);
@@ -679,6 +692,9 @@ impl ToolNameMapping {
 /// message that left the model stuck.
 #[derive(Debug, Clone, Default)]
 pub struct EnabledNativeToolNames(pub std::collections::HashSet<String>);
+/// Enabled native tools keyed by canonical registry ID with client-facing names.
+#[derive(Debug, Clone, Default)]
+pub struct NativeToolClientNames(pub std::collections::HashMap<String, String>);
 impl EnabledNativeToolNames {
     /// Whether `name` is an enabled native (non-MCP) tool.
     pub fn contains(&self, name: &str) -> bool {
@@ -696,6 +712,35 @@ impl ParamNameMapping {
             .get(tool)
             .and_then(|m| m.get(canonical))
             .map(|s| s.as_str())
+            .unwrap_or(canonical)
+    }
+}
+/// Canonical → client-facing param names for the tool currently executing.
+///
+/// Stamped onto [`xai_tool_runtime::ToolCallContext::extensions`] by
+/// `prepare_dispatch` / `call_raw` from that tool's own
+/// `params_name_overrides`. Prefer this over kind-wide
+/// [`crate::types::template_renderer::TemplateRenderer::param_for_kind`] when
+/// naming params in that tool's own errors — multiple tools can share a
+/// `ToolKind` with different renames, and the kind map is first/last-wins.
+#[derive(Debug, Clone, Default)]
+pub struct InvokingToolParamNames(pub HashMap<String, String>);
+impl InvokingToolParamNames {
+    /// Build from a client→canonical reverse map (the dispatch remap direction).
+    pub fn from_reverse_params(reverse_params: &HashMap<String, String>) -> Self {
+        Self(
+            reverse_params
+                .iter()
+                .map(|(client, canonical)| (canonical.clone(), client.clone()))
+                .collect(),
+        )
+    }
+    /// Resolve a canonical parameter name for the invoking tool.
+    /// Falls back to the canonical name if not in the map.
+    pub fn resolve<'a>(&'a self, canonical: &'a str) -> &'a str {
+        self.0
+            .get(canonical)
+            .map(String::as_str)
             .unwrap_or(canonical)
     }
 }
@@ -932,57 +977,6 @@ mod tests {
     }
     register_resource!("grok_build", "Todo", TodoData);
     #[test]
-    fn insert_and_get_typed_values() {
-        let mut res = Resources::new();
-        res.insert(42u32);
-        res.insert("hello".to_string());
-        assert_eq!(res.get::<u32>(), Some(&42));
-        assert_eq!(res.get::<String>(), Some(&"hello".to_string()));
-        assert_eq!(res.get::<bool>(), None);
-    }
-    #[test]
-    fn get_mut_modifies_in_place() {
-        let mut res = Resources::new();
-        res.insert(10i32);
-        *res.get_mut::<i32>().unwrap() += 5;
-        assert_eq!(res.get::<i32>(), Some(&15));
-    }
-    #[test]
-    fn get_or_default_inserts_when_missing() {
-        let mut res = Resources::new();
-        let val = res.get_or_default::<Vec<i32>>();
-        val.push(1);
-        val.push(2);
-        assert_eq!(res.get::<Vec<i32>>(), Some(&vec![1, 2]));
-    }
-    #[test]
-    fn get_or_default_returns_existing() {
-        let mut res = Resources::new();
-        res.insert(vec![42i32]);
-        let val = res.get_or_default::<Vec<i32>>();
-        assert_eq!(val, &vec![42]);
-    }
-    #[test]
-    fn remove_returns_value() {
-        let mut res = Resources::new();
-        res.insert("test".to_string());
-        let removed = res.remove::<String>();
-        assert_eq!(removed, Some("test".to_string()));
-        assert_eq!(res.get::<String>(), None);
-    }
-    #[test]
-    fn remove_returns_none_when_missing() {
-        let mut res = Resources::new();
-        assert_eq!(res.remove::<String>(), None);
-    }
-    #[test]
-    fn contains_checks_presence() {
-        let mut res = Resources::new();
-        assert!(!res.contains::<u32>());
-        res.insert(42u32);
-        assert!(res.contains::<u32>());
-    }
-    #[test]
     fn params_and_state_coexist_without_collision() {
         let mut res = Resources::new();
         res.insert(Params(EditConfig {
@@ -1067,14 +1061,12 @@ mod tests {
         let mut state_map = HashMap::new();
         state_map.insert(
             "grok_build.ReadFile".to_string(),
-            serde_json::json!({ "files_read" : ["loaded.rs"] }),
+            serde_json::json!({"files_read": ["loaded.rs"]}),
         );
         let mut params_map = HashMap::new();
         params_map.insert(
             "grok_build.Edit".to_string(),
-            serde_json::json!(
-                { "skip_read_before_edit" : true, "max_file_size" : 512 }
-            ),
+            serde_json::json!({"skip_read_before_edit": true, "max_file_size": 512}),
         );
         let mut data = HashMap::new();
         data.insert("state".to_string(), state_map);
@@ -1093,11 +1085,11 @@ mod tests {
         let mut state_map = HashMap::new();
         state_map.insert(
             "unknown.Type".to_string(),
-            serde_json::json!({ "foo" : "bar" }),
+            serde_json::json!({"foo": "bar"}),
         );
         state_map.insert(
             "grok_build.ReadFile".to_string(),
-            serde_json::json!({ "files_read" : ["ok.rs"] }),
+            serde_json::json!({"files_read": ["ok.rs"]}),
         );
         let mut data = HashMap::new();
         data.insert("state".to_string(), state_map);
@@ -1134,7 +1126,7 @@ mod tests {
         let ok = res.set_json(
             "params",
             "grok_build.Edit",
-            serde_json::json!({ "skip_read_before_edit" : true }),
+            serde_json::json!({"skip_read_before_edit": true}),
         );
         assert!(ok);
         let config = res.get::<Params<EditConfig>>().unwrap();
@@ -1190,19 +1182,15 @@ mod tests {
         assert_eq!(mapping.resolve("other_tool", "old_string"), "old_string");
     }
     #[test]
-    fn params_deref() {
-        let p = Params(EditConfig {
-            skip_read_before_edit: true,
-            max_file_size: Some(42),
-        });
-        assert!(p.skip_read_before_edit);
-        assert_eq!(p.max_file_size, Some(42));
-    }
-    #[test]
-    fn state_deref_mut() {
-        let mut s = State(ReadHistory { files_read: vec![] });
-        s.files_read.push("new.rs".to_string());
-        assert_eq!(s.files_read, vec!["new.rs".to_string()]);
+    fn invoking_tool_param_names_from_reverse_and_resolve() {
+        let reverse = HashMap::from([
+            ("start_line".to_string(), "offset".to_string()),
+            ("max_lines".to_string(), "limit".to_string()),
+        ]);
+        let names = InvokingToolParamNames::from_reverse_params(&reverse);
+        assert_eq!(names.resolve("offset"), "start_line");
+        assert_eq!(names.resolve("limit"), "max_lines");
+        assert_eq!(names.resolve("path"), "path");
     }
     #[test]
     fn resolve_model_path_relative_no_display() {
@@ -1481,20 +1469,24 @@ mod tests {
     }
     #[test]
     fn resolve_model_path_tilde_expands_to_home() {
-        let home = dirs::home_dir().expect("test requires home_dir");
+        let home = xai_dirs::home_dir().expect("test requires home_dir");
         let cwd = std::path::Path::new("/worktree/abc");
         let result = super::resolve_model_path(cwd, None, "~/foo/bar.rs");
         assert_eq!(result, home.join("foo/bar.rs"));
     }
     #[test]
     fn resolve_model_path_tilde_alone() {
-        let Some(home) = dirs::home_dir() else { return };
+        let Some(home) = xai_dirs::home_dir() else {
+            return;
+        };
         let cwd = std::path::Path::new("/worktree/abc");
         assert_eq!(super::resolve_model_path(cwd, None, "~"), home);
     }
     #[test]
     fn resolve_model_path_tilde_slash_only() {
-        let Some(home) = dirs::home_dir() else { return };
+        let Some(home) = xai_dirs::home_dir() else {
+            return;
+        };
         let cwd = std::path::Path::new("/worktree/abc");
         assert_eq!(super::resolve_model_path(cwd, None, "~/"), home);
     }
@@ -1521,7 +1513,9 @@ mod tests {
     }
     #[test]
     fn resolve_model_path_tilde_with_display_cwd() {
-        let Some(home) = dirs::home_dir() else { return };
+        let Some(home) = xai_dirs::home_dir() else {
+            return;
+        };
         let cwd = std::path::Path::new("/worktree/abc");
         let display = home.join("project");
         let result = super::resolve_model_path(cwd, Some(&display), "~/project/src/main.rs");

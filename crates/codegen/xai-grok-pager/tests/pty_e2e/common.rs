@@ -3,54 +3,73 @@
 //! Individual test modules import via `use super::common::*`.
 
 pub(crate) use serde_json::json;
-pub(crate) use std::path::Path;
+pub(crate) use std::path::{Path, PathBuf};
 pub(crate) use std::time::{Duration, Instant};
 pub(crate) use xai_grok_pager_pty_harness::{
-    ContentController, InferenceEndpoint, InferenceRequestMatcher, MockModel, PtyHarness,
-    ScriptedResponse, SseEvent, keys, oauth_env_for_pager, pager_binary, seed_fake_oauth, sse,
+    AgentTurnExpectation, ContentController, EnvOp, MockModel, PtyExitPoll, PtyHarness,
+    ScriptedResponse, SseEvent, keys, oauth_credential_ops, pager_binary, seed_fake_oauth, sse,
     wait_for_labels_absent, wait_for_model_via_new_sessions,
 };
 
-/// Default PTY size used by every e2e test. Large enough to render the
-/// welcome screen without wrapping, small enough to make `screen_contents()`
-/// scans cheap.
+/// Default PTY size used by every e2e test.
+/// Large enough to render the welcome screen without wrapping, small enough to make `screen_contents()` scans cheap.
 pub(crate) const DEFAULT_ROWS: u16 = 50;
 
 pub(crate) const DEFAULT_COLS: u16 = 120;
 
-/// Default wait-for-welcome timeout. The pager spawns a child shell agent,
-/// which can take a few seconds on cold build directories.
+/// Default wait-for-welcome timeout.
+/// The pager spawns a child shell agent, which can take a few seconds on cold build directories.
 pub(crate) const WELCOME_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Substring we wait for on the welcome screen. Matches the menu label `"Quit"`
-/// (`render_welcome_done` / gate menus); case-sensitive, so it does **not**
-/// match the lowercase `"quit"` hint line during `AuthState::Authenticating`.
+/// Wait budget for a `--continue` / resume to replay the prior transcript back into scrollback.
+/// Resume is strictly heavier than a cold start.
+/// It runs `session/load` (MCP startup, git chores, a full `updates.jsonl` replay, and session spawn) on the agent's single-threaded runtime.
+/// The client-side `acp_send` has no timeout.
+/// Under the fully-parallel pty_e2e suite the starved agent thread can push this well past the 20s `WELCOME_TIMEOUT`.
+/// That leaves the "Loading session…" placeholder up.
+/// A prior 60s budget still timed out under CI load with the same stuck-loading signature.
+/// Match [`WRAP_TIMEOUT`] (120s) for the same contention reason, not because resume is slow when run alone.
+pub(crate) const RESUME_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Substring we wait for on the welcome screen.
+/// Matches the menu label `"Quit"` (`render_welcome_done` / gate menus).
+/// Case-sensitive, so it does **not** match the lowercase `"quit"` hint line during `AuthState::Authenticating`.
 pub(crate) const WELCOME_SCREEN_SENTINEL: &str = "Quit";
 
-/// Prompt sent to the agent in content-driven tests. Short so it submits
-/// quickly and doesn't wrap.
+/// Prompt sent to the agent in content-driven tests.
+/// Short so it submits quickly and doesn't wrap.
 pub(crate) const PROMPT: &str = "go";
 
-/// Response the mock server will stream back. Must contain a stable,
-/// unambiguous sentinel word that we can `wait_for_text` on.
+/// Response the mock server will stream back.
+/// Must contain a stable, unambiguous sentinel word that we can `wait_for_text` on.
 pub(crate) const MOCK_RESPONSE_SENTINEL: &str = "MOCKRESPONSE";
+
+/// The sandbox's unified log (shell-written; forwarded pager entries land here too).
+/// No cross-process helper exists to reuse whole.
+/// `xai_grok_telemetry::unified_log::path()` resolves the calling process's own grok home and the file-name const is private.
+/// So this composes the sandbox grok home with the exported `LOG_DIR`.
+pub(crate) fn unified_log_path(content: &ContentController) -> PathBuf {
+    content
+        .sandbox()
+        .grok_home()
+        .join(xai_grok_telemetry::unified_log::LOG_DIR)
+        .join("unified.jsonl")
+}
 
 // ── Undo-tip e2e helpers ────────────────────────────────────────────────
 
-/// Suffix of the undo-tip banner, now "Input cleared · ctrl+z to undo" on all
-/// platforms (terminals don't forward Cmd+Z to a raw-mode TUI). Asserting the
-/// suffix keeps the check chord-agnostic regardless.
+/// Suffix of the undo-tip banner, now "Input cleared · ctrl+z to undo" on all platforms (terminals don't forward Cmd+Z to a raw-mode TUI).
+/// Asserting only the suffix keeps the check independent of which chord the banner names.
 pub(crate) const UNDO_TIP_SENTINEL: &str = "to undo";
 
-/// A >= FIRE_PEAK_LEN (20) char draft. The first char promotes the welcome
-/// prompt to a real (routed) agent session; the rest accumulate into the draft.
+/// A draft of FIRE_PEAK_LEN (20) or more chars.
+/// The first char promotes the welcome prompt to a real (routed) agent session; the rest accumulate into the draft.
 pub(crate) const SUBSTANTIAL_DRAFT: &[u8] = b"aaaaaaaaaaaaaaaaaaaaaaaaa";
 
-/// Type a substantial draft, wait for it to render in the promoted agent
-/// prompt, then wipe it with Ctrl+U (0x15, kill-to-BOL) — a substantial,
-/// recoverable wipe that triggers the undo tip. Typing and the kill are
-/// injected separately (with a settle in between) to avoid racing the async
-/// welcome→session promotion; the same shape the scripted scenarios use.
+/// Type a substantial draft, wait for it to render in the promoted agent prompt, then wipe it with Ctrl+U (0x15, kill-to-BOL).
+/// That wipe is substantial and recoverable, so it triggers the undo tip.
+/// Typing and the kill are injected separately (with a settle in between) to avoid racing the async welcome-to-session promotion.
+/// The scripted scenarios use the same shape.
 pub(crate) fn wipe_substantial_draft(harness: &mut PtyHarness) {
     harness
         .inject_keys(SUBSTANTIAL_DRAFT)
@@ -61,13 +80,8 @@ pub(crate) fn wipe_substantial_draft(harness: &mut PtyHarness) {
     harness.inject_keys(b"\x15").expect("Ctrl+U kill-to-BOL");
 }
 
-/// Content env plus the contextual-hints opt-in. The feature ships default-OFF,
-/// so the undo tip (a contextual hint) only fires when explicitly enabled.
-pub(crate) fn contextual_hints_env(content: &ContentController) -> Vec<(String, String)> {
-    let mut env = content.env_for_pager();
-    env.push(("GROK_CONTEXTUAL_HINTS".into(), "1".into()));
-    env
-}
+/// Contextual-hints opt-in. The feature ships default-OFF.
+pub(crate) const CONTEXTUAL_HINTS_ENV: &[(&str, &str)] = &[("GROK_CONTEXTUAL_HINTS", "1")];
 
 /// Collect short OSC 8 payloads for assertion failure messages.
 pub(crate) fn osc8_snippets(raw: &str) -> String {
@@ -106,19 +120,17 @@ pub(crate) fn long_response(sentinel: &str, lines: usize) -> String {
     s
 }
 
-/// A response that renders to **at least `rows` terminal rows**, with `sentinel`
-/// on the first row so it is the first line to scroll into native scrollback.
+/// A response that renders to **at least `rows` terminal rows**.
+/// `sentinel` sits on the first row so it is the first line to scroll into native scrollback.
 ///
-/// Unlike [`long_response`], each source line is wrapped in a fenced code block
-/// so markdown does **not** reflow the lines into one soft-wrapped paragraph —
-/// each `line N` becomes exactly one rendered row. This is what makes the block
-/// genuinely taller than the screen (a 60-*line* prose paragraph reflows to only
-/// ~30 rows at typical widths and fits on screen, so it would *not* overflow into
-/// scrollback — the content-anchored live region correctly keeps it visible).
+/// Unlike [`long_response`], each source line is wrapped in a fenced code block so markdown does **not** reflow them into one soft-wrapped paragraph.
+/// Each `line N` becomes exactly one rendered row.
+/// This is what makes the block genuinely taller than the screen.
+/// A 60-*line* prose paragraph reflows to only ~30 rows at typical widths and fits on screen, so it would *not* overflow into scrollback.
+/// The content-anchored live region keeps it visible.
 ///
-/// Use this for the commit-to-scrollback contract tests, which need the block's
-/// own head to scroll above the pinned viewport into the terminal's native
-/// history.
+/// Use this for the commit-to-scrollback contract tests.
+/// They need the block's own head to scroll above the pinned viewport into the terminal's native history.
 pub(crate) fn tall_response(sentinel: &str, rows: usize) -> String {
     let mut s = String::with_capacity(rows * 24);
     s.push_str("```\n");
@@ -132,41 +144,36 @@ pub(crate) fn tall_response(sentinel: &str, rows: usize) -> String {
 }
 
 // ── Fake session-auth (OAuth) seeding ───────────────────────────────────
-// `seed_fake_oauth` / `oauth_env_for_pager` live in
-// `xai_grok_pager_pty_harness::flows` (re-exported above).
+// `seed_fake_oauth` / `oauth_credential_ops` live in `xai_grok_pager_pty_harness::flows` (re-exported above)
 
-/// Spawn a pager with fake session (OAuth) auth and a 1s announcements poll,
-/// then drive it into a live session (welcome → prompt → mock response).
-/// Session auth matters: the settings poll requires `auth_manager.auth()`, and
-/// the harness's default `XAI_API_KEY` (ApiKey/BYOK mode, no auth.json entry)
-/// would never fetch `/v1/settings`. Spawns WITHOUT `GROK_ANNOUNCEMENTS_OVERRIDE`
-/// (the env override beats pushed lists in the pager and would mask updates).
+/// Spawn a pager with fake session (OAuth) auth and a 1s announcements poll, then drive it into a live session (welcome, prompt, mock response).
+/// Session auth matters: the settings poll requires `auth_manager.auth()`.
+/// The harness's default `XAI_API_KEY` (ApiKey/BYOK mode, no auth.json entry) would never fetch `/v1/settings`.
+/// Spawns WITHOUT `GROK_ANNOUNCEMENTS_OVERRIDE` (the env override beats pushed lists in the pager and would mask updates).
 /// Call `content.set_response(..)` BEFORE this so the entry prompt streams.
 pub(crate) fn spawn_polling_session(content: &ContentController, oauth_user: &str) -> PtyHarness {
     spawn_polling_session_with_env(content, oauth_user, &[])
 }
 
-/// [`spawn_polling_session`] with extra env pairs appended after the shared
-/// oauth/poll env (e.g. a test-seam path or a `TERM_PROGRAM` pin).
+/// [`spawn_polling_session`] with extra env pairs appended after the shared oauth/poll env (e.g. a test-override path or a `TERM_PROGRAM` pin).
 pub(crate) fn spawn_polling_session_with_env(
     content: &ContentController,
     oauth_user: &str,
     extra_env: &[(&str, &str)],
 ) -> PtyHarness {
     seed_fake_oauth(content, oauth_user);
-    let env = oauth_env_for_pager(content);
-    let mut env_refs: Vec<(&str, &str)> =
-        env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    env_refs.push(("GROK_ANNOUNCEMENTS_REFRESH_INTERVAL_SECS", "1"));
-    env_refs.extend_from_slice(extra_env);
+    let mut overrides = Vec::from(oauth_credential_ops());
+    overrides.push(EnvOp::set("GROK_ANNOUNCEMENTS_REFRESH_INTERVAL_SECS", "1"));
+    overrides.extend(extra_env.iter().map(|(key, value)| EnvOp::set(key, value)));
 
     let binary = pager_binary().expect("resolve pager binary");
-    let mut harness = PtyHarness::new_in_dir(
+    let mut harness = PtyHarness::spawn_with_content_env_ops_in_dir(
         &binary,
         DEFAULT_ROWS,
         DEFAULT_COLS,
+        content,
         &[],
-        &env_refs,
+        &overrides,
         Some(content.home()),
     )
     .expect("spawn pager with polling session auth");
@@ -185,10 +192,9 @@ pub(crate) fn spawn_polling_session_with_env(
 
 // ── Agent type mismatch e2e tests ──────────────────────────────────────
 
-/// Start the mock server with two models that have different agent types,
-/// and return a `ContentController` configured for agent-type-mismatch
-/// testing. The default model is `"default-model"` (no agent type → uses
-/// `grok-build` harness).
+/// Start the mock server with two models that have different agent types.
+/// Returns a `ContentController` configured for agent-type-mismatch testing.
+/// The default model is `"default-model"` (no agent type, so it uses the `grok-build` harness).
 pub(crate) async fn start_dual_agent_type_content() -> ContentController {
     ContentController::start_with_models(vec![
         MockModel::new("default-model"),
@@ -203,9 +209,8 @@ pub(crate) async fn start_dual_agent_type_content() -> ContentController {
 /// Title line of the folder-trust question (see `render_welcome_trust`).
 pub(crate) const TRUST_QUESTION_SENTINEL: &str = "Do you trust the contents of this directory";
 
-/// A `git init`'d temp dir containing a repo-local `.mcp.json` (code-exec
-/// config). `repo_configs_present` returns true for it, so an untrusted clone
-/// with the feature on resolves to `Prompt` => the trust question renders.
+/// A `git init`'d temp dir containing a repo-local `.mcp.json` (code-exec config).
+/// `repo_configs_present` returns true for it, so an untrusted clone with the feature on resolves to `Prompt` and the trust question renders.
 pub(crate) fn git_repo_with_mcp_json() -> tempfile::TempDir {
     let repo = tempfile::tempdir().expect("repo tempdir");
     git2::Repository::init(repo.path()).expect("git init");
@@ -213,22 +218,13 @@ pub(crate) fn git_repo_with_mcp_json() -> tempfile::TempDir {
     repo
 }
 
-/// Env for a folder-trust run: the mock-server env plus a simulated release stamp
-/// (`GROK_TEST_VERSION`) and an explicit `GROK_FOLDER_TRUST` — `1` when `feature_on`,
-/// else `0` (an explicit opt-out that overrides the now-on default). HOME/GROK_HOME
-/// point at the isolated temp home, so the trust store starts empty.
-pub(crate) fn trust_env(content: &ContentController, feature_on: bool) -> Vec<(String, String)> {
-    let mut env = content.env_for_pager();
-    // A self-built (unstamped) grok auto-trusts and never prompts; simulate a
-    // release build so the folder-trust feature is actually evaluated here. The
-    // feature-off case below then exercises the TRUE feature-off path, not
-    // auto-trust.
-    env.push(("GROK_TEST_VERSION".into(), "0.0.0-sim".into()));
-    // Set GROK_FOLDER_TRUST explicitly: the default is on, so `0` is the opt-out
-    // that exercises the feature-off path rather than relying on an absent var.
-    let folder_trust = if feature_on { "1" } else { "0" };
-    env.push(("GROK_FOLDER_TRUST".into(), folder_trust.into()));
-    env
+/// Explicit overrides for a folder-trust run.
+/// A self-built grok auto-trusts, so `GROK_TEST_VERSION` simulates a release; the gate is pinned both ways.
+pub(crate) fn trust_env(feature_on: bool) -> [(&'static str, &'static str); 2] {
+    [
+        ("GROK_TEST_VERSION", "0.0.0-sim"),
+        ("GROK_FOLDER_TRUST", if feature_on { "1" } else { "0" }),
+    ]
 }
 
 /// Whether the isolated trust store has recorded a grant for `repo`'s workspace.
@@ -242,19 +238,16 @@ pub(crate) fn folder_is_trusted(content: &ContentController, repo: &std::path::P
 }
 
 // ── Leader mode e2e ─────────────────────────────────────────────────────
-// The leader cluster cases (and their LEADER_TIMEOUT/STREAM_TIMEOUT/
-// submit_turn/inference_request_count helpers) moved to the dedicated
-// `tests/leader_pty_e2e` target; only the helpers non-leader tests still
-// use remain here.
+// The leader cluster cases moved to the dedicated `tests/leader_pty_e2e` target
+// Their LEADER_TIMEOUT/STREAM_TIMEOUT/submit_turn/inference_request_count helpers moved with them
+// Only the helpers non-leader tests still use remain here
 
-/// Sentinel for turn `n`, short enough to never wrap at 120 cols
-/// (wrapping would break the exactly-once occurrence counts).
+/// Sentinel for turn `n`, short enough to never wrap at 120 cols (wrapping would break the exactly-once occurrence counts).
 pub(crate) fn turn_sentinel(n: u8) -> String {
     format!("{MOCK_RESPONSE_SENTINEL}_T{n}")
 }
 
-// `wait_for_labels_absent` lives in `xai_grok_pager_pty_harness::flows`
-// (re-exported above).
+// `wait_for_labels_absent` lives in `xai_grok_pager_pty_harness::flows` (re-exported above)
 
 // ── MCP menu loading e2e tests ──────────────────────────────────────────
 
@@ -355,8 +348,7 @@ pub(crate) fn all_user_messages(content: &ContentController) -> Vec<String> {
         .collect()
 }
 
-/// Visible screen lines showing `text` INSIDE the bordered composer (the
-/// prompt-box row carries a `│` border; committed scrollback lines don't).
+/// Visible screen lines showing `text` INSIDE the bordered composer (the prompt-box row carries a `│` border; committed scrollback lines don't).
 /// Keep needles short enough not to wrap at [`DEFAULT_COLS`].
 pub(crate) fn composer_holds(harness: &PtyHarness, text: &str) -> bool {
     harness
@@ -365,9 +357,8 @@ pub(crate) fn composer_holds(harness: &PtyHarness, text: &str) -> bool {
         .any(|l| l.contains('│') && l.contains(text))
 }
 
-/// Count of visible screen lines showing `text` OUTSIDE the bordered
-/// composer — committed scrollback copies. The exactly-once ledger for the
-/// cancel/rewind duplicate-render regressions.
+/// Count of visible screen lines showing `text` OUTSIDE the bordered composer (committed scrollback copies).
+/// The cancel/rewind duplicate-render regression tests assert this count is exactly one.
 pub(crate) fn block_lines_containing(harness: &PtyHarness, text: &str) -> usize {
     harness
         .screen_contents()
@@ -376,25 +367,22 @@ pub(crate) fn block_lines_containing(harness: &PtyHarness, text: &str) -> usize 
         .count()
 }
 
-/// 19b. **VS Code family: Ctrl+L (form feed)** is the send-now chord, same
-/// semantics as the default Ctrl+Enter binding. Harness strips `TERM_PROGRAM`
-/// then applies env — pass `vscode` so defaults bind the chord to Ctrl+L.
+/// 19b. **VS Code family: Ctrl+L (form feed)** is the send-now chord, behaving like the default Ctrl+Enter binding.
+/// Harness strips `TERM_PROGRAM` then applies env; pass `vscode` so defaults bind the chord to Ctrl+L.
 pub(crate) const CTRL_L: &[u8] = b"\x0c";
 
-/// Ctrl+O (C0 0x0F). On Apple Terminal this is the InterjectPrompt / send-now
-/// chord; in minimal mode it also doubles as the transcript-pager remap when
-/// interject would no-op.
+/// Ctrl+O (C0 0x0F).
+/// On Apple Terminal this is the InterjectPrompt / send-now chord.
+/// In minimal mode it also doubles as the transcript-pager remap when interject would no-op.
 pub(crate) const CTRL_O: &[u8] = b"\x0f";
 
-/// Suffix of the mid-turn send-now tip: `Queued · Enter to send now` (or the
-/// interject chord in multiline). Chord-agnostic like [`UNDO_TIP_SENTINEL`].
+/// Suffix of the mid-turn send-now tip: `Queued · Enter to send now` (or the interject chord in multiline).
+/// Chord-agnostic like [`UNDO_TIP_SENTINEL`].
 pub(crate) const SEND_NOW_TIP_SENTINEL: &str = "to send now";
 
-// NOTE: The SessionStart hook exactly-once e2e test is deferred.
-// The core fix (deduplication in load_hooks_from_sources) is verified by
-// unit tests in xai-grok-hooks::discovery::tests. The PTY E2E test requires
-// careful environment variable setup to avoid static caching issues with
-// GROK_HOME.
+// NOTE: There is no SessionStart hook exactly-once e2e test
+// Deduplication in load_hooks_from_sources is covered by unit tests in xai-grok-hooks::discovery::tests
+// A PTY e2e test would need careful environment variable setup to avoid static caching issues with GROK_HOME
 
 // ── Mouse reporting toggle (opt-in scrollback Ctrl+R) ───────────────────
 
@@ -406,9 +394,8 @@ pub(crate) const MOUSE_OFF_STICKY: &str =
 pub(crate) const MOUSE_OFF_HINT_PROMPT: &str =
     "/toggle-mouse-reporting to enable mouse reporting and restore TUI features";
 
-/// Seed `~/.grok/config.toml` with a `[ui]` section body (e.g.
-/// `"vim_mode = true"`). Same `{GROK_HOME|HOME}/.grok/config.toml` location
-/// `seed_mouse_reporting_toggle_config` uses; call before spawning the pager.
+/// Seed `~/.grok/config.toml` with a `[ui]` section body (e.g. `"vim_mode = true"`).
+/// Same `{GROK_HOME|HOME}/.grok/config.toml` location `seed_mouse_reporting_toggle_config` uses; call before spawning the pager.
 pub(crate) fn seed_ui_config(content: &ContentController, ui_body: &str) {
     let grok_home = content.home().join(".grok");
     std::fs::create_dir_all(&grok_home).expect("create .grok");
@@ -419,7 +406,7 @@ pub(crate) fn seed_ui_config(content: &ContentController, ui_body: &str) {
 pub(crate) fn seed_mouse_reporting_toggle_config(content: &ContentController, enabled: bool) {
     let grok_home = content.home().join(".grok");
     std::fs::create_dir_all(&grok_home).expect("create .grok");
-    // Minimal opt-in only — matches load_config's `{GROK_HOME|HOME}/.grok/config.toml`.
+    // Minimal opt-in only; matches load_config's `{GROK_HOME|HOME}/.grok/config.toml`
     let config = if enabled {
         "[ui]\nmouse_reporting_toggle = true\n"
     } else {
@@ -440,27 +427,23 @@ pub(crate) fn seed_keep_text_selection_config(content: &ContentController) {
     .expect("write config.toml");
 }
 
-/// Content env plus opt-in enablement env (belt-and-suspenders with config seed).
-pub(crate) fn mouse_toggle_env(content: &ContentController) -> Vec<(String, String)> {
-    let mut env = content.env_for_pager();
-    env.push(("GROK_MOUSE_REPORTING_TOGGLE".into(), "true".into()));
-    env
-}
-
-/// Spawn pager with content + mouse-toggle env (same base as `spawn_with_content`,
-/// but forwards the extra enablement env that `spawn_with_content` alone omits).
+/// Spawn pager with the mouse-toggle opt-in after the sandbox baseline.
 pub(crate) fn spawn_mouse_toggle_pager(content: &ContentController) -> PtyHarness {
     let binary = pager_binary().expect("resolve pager binary");
-    let env = mouse_toggle_env(content);
-    let env_refs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    PtyHarness::new(&binary, DEFAULT_ROWS, DEFAULT_COLS, &[], &env_refs).expect("spawn pager")
+    PtyHarness::spawn_with_content_env_ops(
+        &binary,
+        DEFAULT_ROWS,
+        DEFAULT_COLS,
+        content,
+        &[],
+        &[EnvOp::set("GROK_MOUSE_REPORTING_TOGGLE", "true")],
+    )
+    .expect("spawn pager")
 }
 
-/// Inject keys one byte at a time with a short drain between each so the pager
-/// event loop processes them as discrete key events. Bulk injects (especially
-/// post-turn when non-dev builds are not metronoming on `tracing_rx`) can arrive
-/// in a single `EventStream` batch and get paste-coalesced (`[Pasted: N lines]`),
-/// which never reaches slash submit.
+/// Inject keys one byte at a time with a short drain between each so the pager event loop processes them as discrete key events.
+/// Bulk injects (especially post-turn, when no steady `tracing_rx` tick wakes non-dev builds) can arrive in a single `EventStream` batch.
+/// They then get paste-coalesced (`[Pasted: N lines]`), which never reaches slash submit.
 pub(crate) fn inject_keys_paced(harness: &mut PtyHarness, keys: &[u8]) {
     for &b in keys {
         harness.inject_keys(&[b]).expect("inject paced key");
@@ -468,21 +451,23 @@ pub(crate) fn inject_keys_paced(harness: &mut PtyHarness, keys: &[u8]) {
     }
 }
 
-/// Widens the pager's idle-Esc double-press window (bounded by
-/// `esc_double_press_ttl` in `app_view.rs`) so a loaded shard's inter-press
-/// render round-trip can't expire the arm.
+/// Widens the pager's idle-Esc double-press window (bounded by `esc_double_press_ttl` in `app_view.rs`).
+/// On a loaded shard, the render round-trip between the two presses must not expire the pending first press.
 pub(crate) const ESC_DOUBLE_PRESS_ENV: &str = "GROK_ESC_DOUBLE_PRESS_MS";
 
 /// Spawn the pager with [`ESC_DOUBLE_PRESS_ENV`] set to the 60s cap.
 pub(crate) fn spawn_esc_double_press_pager(content: &ContentController) -> PtyHarness {
     let binary = pager_binary().expect("resolve pager binary");
-    let mut env = content.env_for_pager();
-    env.push((
-        ESC_DOUBLE_PRESS_ENV.to_string(),
-        xai_grok_pager::app::app_view::ESC_DOUBLE_PRESS_TEST_MS.to_string(),
-    ));
-    let env_refs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    PtyHarness::new(&binary, DEFAULT_ROWS, DEFAULT_COLS, &[], &env_refs).expect("spawn pager")
+    let value = xai_grok_pager::app::app_view::ESC_DOUBLE_PRESS_TEST_MS.to_string();
+    PtyHarness::spawn_with_content_env_ops(
+        &binary,
+        DEFAULT_ROWS,
+        DEFAULT_COLS,
+        content,
+        &[],
+        &[EnvOp::set(ESC_DOUBLE_PRESS_ENV, value.as_str())],
+    )
+    .expect("spawn pager")
 }
 
 /// Reach an agent session with scrollback content, then focus scrollback (Tab).
@@ -501,8 +486,7 @@ pub(crate) async fn drive_to_scrollback_with_turn(
         .wait_for_text(MOCK_RESPONSE_SENTINEL, Duration::from_secs(30))
         .expect("turn rendered");
     // Leave the prompt so scrollback-only Ctrl+R can fire (unbound on the prompt).
-    // Tab is the leave-prompt / focus-scrollback key (Esc is clear/rewind idle /
-    // mid-turn swallow).
+    // Tab is the leave-prompt / focus-scrollback key (Esc is reserved for the cancel / clear / rewind policy)
     harness.inject_keys(b"\t").expect("focus scrollback (tab)");
     harness.update(Duration::from_millis(500));
     // Footer shows "Space:prompt" when scrollback owns keys (prompt is not focused).
@@ -582,14 +566,8 @@ pub(crate) fn responses_api_tool_call_events(
     events
 }
 
-/// Chat Completions SSE stream with a single tool_call (fallback endpoint).
-pub(crate) fn chat_completions_tool_call_events(name: &str, arguments: &str) -> Vec<SseEvent> {
-    chat_completions_tool_call_events_with_id("call_read_hdr", name, arguments)
-}
-
-/// [`chat_completions_tool_call_events`] with an explicit `tool_call` id, for
-/// tests scripting several calls into ONE conversation (a reused id would
-/// alias distinct calls in history and confuse dangling-call bookkeeping).
+/// [`chat_completions_tool_call_events`] with an explicit `tool_call` id, for tests scripting several calls into ONE conversation.
+/// A reused id would alias distinct calls in history and confuse dangling-call bookkeeping.
 pub(crate) fn chat_completions_tool_call_events_with_id(
     call_id: &str,
     name: &str,
@@ -643,104 +621,8 @@ pub(crate) fn chat_completions_tool_call_events_with_id(
     ]
 }
 
-/// Responses API SSE stream that emits a single assistant text message —
-/// the FIFO counterpart of `set_response` for tests scripting DISTINCT text
-/// replies per turn (e.g. one per auto-wake).
-pub(crate) fn responses_api_message_events(text: &str) -> Vec<SseEvent> {
-    vec![
-        SseEvent::data(
-            json!({
-                "type": "response.created",
-                "sequence_number": 0,
-                "response": {
-                    "id": "resp_text",
-                    "object": "response",
-                    "created_at": 1234567890,
-                    "model": "test-model",
-                    "status": "in_progress",
-                    "output": []
-                }
-            })
-            .to_string(),
-        ),
-        SseEvent::data(
-            json!({
-                "type": "response.output_text.delta",
-                "sequence_number": 1,
-                "item_id": "item_text",
-                "output_index": 0,
-                "content_index": 0,
-                "delta": text
-            })
-            .to_string(),
-        ),
-        SseEvent::data(
-            json!({
-                "type": "response.completed",
-                "sequence_number": 2,
-                "response": {
-                    "id": "resp_text",
-                    "object": "response",
-                    "created_at": 1234567890,
-                    "model": "test-model",
-                    "status": "completed",
-                    "output": [{
-                        "type": "message",
-                        "id": "msg_text",
-                        "role": "assistant",
-                        "status": "completed",
-                        "content": [{
-                            "type": "output_text",
-                            "text": text,
-                            "annotations": []
-                        }]
-                    }],
-                    "usage": {
-                        "input_tokens": 10,
-                        "output_tokens": 10,
-                        "total_tokens": 20,
-                        "input_tokens_details": { "cached_tokens": 0 },
-                        "output_tokens_details": { "reasoning_tokens": 0 }
-                    }
-                }
-            })
-            .to_string(),
-        ),
-        SseEvent::data("[DONE]".to_string()),
-    ]
-}
-
-/// Chat Completions SSE stream with a single assistant text message
-/// (fallback endpoint counterpart of [`responses_api_message_events`]).
-pub(crate) fn chat_completions_message_events(text: &str) -> Vec<SseEvent> {
-    vec![
-        SseEvent::data(
-            json!({
-                "id": "chatcmpl-text",
-                "object": "chat.completion.chunk",
-                "created": 1234567890,
-                "model": "test-model",
-                "choices": [{
-                    "index": 0,
-                    "delta": { "role": "assistant", "content": text },
-                    "finish_reason": "stop"
-                }],
-                "usage": {
-                    "prompt_tokens": 10,
-                    "completion_tokens": 10,
-                    "total_tokens": 20
-                }
-            })
-            .to_string(),
-        ),
-        SseEvent::data("[DONE]".to_string()),
-    ]
-}
-
-/// Poll the raw PTY stream until at least one OSC 52 clipboard payload has
-/// been flushed (or `timeout` elapses), then return everything decoded so
-/// far. A copy lands asynchronously after the triggering input, so a fixed
-/// post-release sleep flakes under CI/host load.
+/// Poll the raw PTY stream until at least one OSC 52 clipboard payload is flushed (or `timeout` elapses), then return everything decoded so far.
+/// A copy lands asynchronously after the triggering input, so a fixed post-release sleep flakes under CI/host load.
 pub(crate) fn wait_for_osc52_payloads(harness: &mut PtyHarness, timeout: Duration) -> Vec<String> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -760,9 +642,8 @@ pub(crate) fn decode_osc52_payloads(bytes: &[u8]) -> Vec<String> {
         let Some((_, rest)) = segment.split_once(';') else {
             continue;
         };
-        // No BEL/ST terminator yet = mid-flush tail; skip it so the poll in
-        // wait_for_osc52_payloads waits for the complete payload instead of
-        // decoding a truncated-but-valid base64 quantum.
+        // No BEL/ST terminator yet means a mid-flush tail
+        // Skip it so the poll in wait_for_osc52_payloads waits for the complete payload instead of decoding a truncated prefix that still parses as base64
         let Some(end) = rest.find(['\x07', '\x1b']) else {
             continue;
         };
@@ -779,9 +660,8 @@ pub(crate) fn decode_osc52_payloads(bytes: &[u8]) -> Vec<String> {
     payloads
 }
 
-/// One SGR (DECSET 1006) mouse report for button `btn` at 0-based (row,col),
-/// emitted as the 1-based SGR wire encoding:
-/// `suffix` 'M' = press/motion, 'm' = release; `btn` carries the +32 motion bit / +64 wheel bit.
+/// One SGR (DECSET 1006) mouse report for button `btn` at 0-based (row,col), emitted as the 1-based SGR wire encoding:
+/// `suffix` 'M' means press/motion and 'm' means release; `btn` carries the +32 motion bit and the +64 wheel bit.
 /// Encoding spec: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h2-Mouse-Tracking
 pub(crate) fn sgr_mouse(btn: u16, row: u16, col: u16, suffix: char) -> String {
     format!("\x1b[<{btn};{};{}{suffix}", col + 1, row + 1)
@@ -797,11 +677,10 @@ pub(crate) fn mouse_drag_line(row: u16, from_col: u16, to_col: u16) -> String {
     out
 }
 
-/// SGR mouse press + drag from (row,from_col) to (row,to_col) inclusive with no
-/// final release — reproduces a lost `Up(Left)` so the drag stays latched. Real
-/// terminals drop the release this way when the mouseup lands off the terminal
-/// element (or is coalesced/dropped over Remote-SSH): xtermjs/xterm.js#4781
-/// ("It works if mouseup occurs outside the terminal element"), microsoft/vscode#192518.
+/// SGR mouse press and drag from (row,from_col) to (row,to_col) inclusive with no final release.
+/// Reproduces a lost `Up(Left)` so the drag stays latched.
+/// Real terminals drop the release this way when the mouseup lands off the terminal element (or is coalesced/dropped over Remote-SSH).
+/// xtermjs/xterm.js#4781 ("It works if mouseup occurs outside the terminal element"), microsoft/vscode#192518.
 pub(crate) fn mouse_drag_no_release(row: u16, from_col: u16, to_col: u16) -> String {
     let mut out = String::new();
     out.push_str(&sgr_mouse(0, row, from_col, 'M')); // press
@@ -820,28 +699,25 @@ pub(crate) fn locate_screen_text(screen: &str, needle: &str) -> Option<(u16, u16
     None
 }
 
-/// Queue one scripted tool-call turn on both inference endpoints (only the
-/// endpoint the agent actually uses drains its FIFO; the other stays parked).
-pub(crate) fn enqueue_tool_turn(
+/// Register one named scripted tool-call turn on both inference endpoints.
+pub(crate) fn expect_tool_turn(
     content: &ContentController,
     call_id: &str,
     name: &str,
     args: String,
-) {
-    content.enqueue_response(
-        "/v1/responses",
+) -> AgentTurnExpectation {
+    content.expect_agent_turn_with_responses(
+        format!("tool turn {call_id}"),
         ScriptedResponse::sse(responses_api_tool_call_events(call_id, name, &args)),
-    );
-    content.enqueue_response(
-        "/v1/chat/completions",
-        ScriptedResponse::sse(chat_completions_tool_call_events(name, &args)),
-    );
+        ScriptedResponse::sse(chat_completions_tool_call_events_with_id(
+            call_id, name, &args,
+        )),
+    )
 }
 
-/// Responses API SSE stream whose `response.completed` output carries one
-/// `function_call` item per entry of `calls` — a single model turn invoking
-/// parallel tool calls. Each entry is `(call_id, name, arguments)`; ids must
-/// be distinct or history bookkeeping aliases the calls.
+/// Responses API SSE stream whose `response.completed` output carries one `function_call` item per entry of `calls`.
+/// That is a single model turn invoking parallel tool calls.
+/// Each entry is `(call_id, name, arguments)`; ids must be distinct or history bookkeeping aliases the calls.
 pub(crate) fn responses_api_parallel_tool_call_events(
     calls: &[(&str, &str, String)],
 ) -> Vec<SseEvent> {
@@ -913,9 +789,8 @@ pub(crate) fn responses_api_parallel_tool_call_events(
     events
 }
 
-/// Chat Completions twin of [`responses_api_parallel_tool_call_events`]: one
-/// chunk whose `delta.tool_calls` carries every call (index 0, 1, …), then a
-/// `finish_reason: "tool_calls"` chunk.
+/// Chat Completions twin of [`responses_api_parallel_tool_call_events`].
+/// One chunk whose `delta.tool_calls` carries every call (index 0, 1, …), then a `finish_reason: "tool_calls"` chunk.
 pub(crate) fn chat_completions_parallel_tool_call_events(
     calls: &[(&str, &str, String)],
 ) -> Vec<SseEvent> {
@@ -973,8 +848,7 @@ pub(crate) fn chat_completions_parallel_tool_call_events(
     ]
 }
 
-/// Queue one scripted turn with parallel tool calls on both inference
-/// endpoints (see [`enqueue_tool_turn`]).
+/// Queue one scripted turn with parallel tool calls on both inference endpoints (see [`expect_tool_turn`]).
 pub(crate) fn enqueue_parallel_tool_turn(
     content: &ContentController,
     calls: &[(&str, &str, String)],
@@ -989,58 +863,99 @@ pub(crate) fn enqueue_parallel_tool_turn(
     );
 }
 
-/// Seed a target file under the isolated HOME and queue a scripted `read_file`
-/// tool call (Responses + Chat Completions) so the pager renders a Read header.
-pub(crate) fn seed_read_file_tool_call(content: &ContentController, abs_path: &Path) {
+/// Seed a target file under the isolated HOME and queue a scripted `read_file` tool call (Responses and Chat Completions).
+/// The pager then renders a Read header.
+pub(crate) fn seed_read_file_tool_call(
+    content: &ContentController,
+    abs_path: &Path,
+) -> AgentTurnExpectation {
     let args = json!({ "target_file": abs_path.to_string_lossy() }).to_string();
-    // Prefer Responses API (primary agent path); also queue Chat Completions.
-    content.enqueue_response(
-        "/v1/responses",
-        ScriptedResponse::sse(responses_api_tool_call_events(
-            "call_read_hdr",
-            "read_file",
-            &args,
-        )),
-    );
-    content.enqueue_response(
-        "/v1/chat/completions",
-        ScriptedResponse::sse(chat_completions_tool_call_events("read_file", &args)),
-    );
+    let turn = expect_tool_turn(content, "call_read_hdr", "read_file", args);
     // Follow-up turn after tool result: plain completion so the session settles.
     content.set_response(READ_HDR_SENTINEL);
+    turn
 }
 
 // ── Minimal (scrollback-native) mode e2e helpers ────────────────────────
 
-/// Args that launch the pager in the experimental scrollback-native minimal
-/// mode, standalone — minimal is single-session (K14: no leader/multi-client),
-/// so `--no-leader` keeps the test off the shared-daemon path.
+/// Args that launch the pager in the experimental scrollback-native minimal mode, standalone.
+/// Minimal is single-session (no leader/multi-client), so `--no-leader` keeps the test off the shared-daemon path.
 pub(crate) const MINIMAL_ARGS: &[&str] = &["--minimal", "--no-leader"];
 
-/// Idle status-line text minimal renders at the prompt (see
-/// `crate::minimal::live::render_status`). Distinct from the running status
-/// (`working…`), so it doubles as a "ready / turn finished" sentinel.
+/// Idle status-line text minimal renders at the prompt (see `crate::minimal::live::render_status`).
+/// Distinct from the running status (`working…`), so it doubles as a "ready / turn finished" sentinel.
 pub(crate) const MINIMAL_IDLE_SENTINEL: &str = "minimal · /help";
 
 /// Idle status after a slash `/minimal` re-exec (switch-back cue present).
-/// Distinct from [`MINIMAL_IDLE_SENTINEL`] — cold `--minimal` starts omit the
-/// reverse-command segment.
+/// Distinct from [`MINIMAL_IDLE_SENTINEL`]: cold `--minimal` starts omit the reverse-command segment.
 pub(crate) const MINIMAL_SWITCH_BACK_IDLE_SENTINEL: &str =
     "minimal · /fullscreen to go back · /help";
+
+/// Header of minimal's parked plan-approval controls strip.
+pub(crate) const PLAN_PARKED_SENTINEL: &str = "Plan ready for review";
+
+/// A plan body the `exit_plan_mode` tool will read off disk.
+/// Every step carries a unique `{tag}{NNN}` sentinel, because a truncated plan still contains its head and would pass a plain substring check.
+pub(crate) fn plan_body(tag: &str, lines: usize) -> String {
+    let mut s = format!("# {tag} Plan\n\n");
+    for i in 0..lines {
+        s.push_str(&format!("- {tag}{i:03} step of the plan\n"));
+    }
+    s
+}
+
+/// Steps of a [`plan_body`] missing from everything the user could reach by scrolling: native scrollback plus the visible screen.
+pub(crate) fn plan_lines_missing(harness: &mut PtyHarness, tag: &str, lines: usize) -> Vec<usize> {
+    let full = harness.full_text();
+    (0..lines)
+        .filter(|i| !full.contains(&format!("{tag}{i:03}")))
+        .collect()
+}
+
+/// Steps of a [`plan_body`] that appear more than once: the print-once guard.
+pub(crate) fn plan_lines_duplicated(
+    harness: &mut PtyHarness,
+    tag: &str,
+    lines: usize,
+) -> Vec<usize> {
+    let full = harness.full_text();
+    (0..lines)
+        .filter(|i| full.matches(&format!("{tag}{i:03}")).count() > 1)
+        .collect()
+}
+
+/// Locate `<grok_home>/sessions/<encoded cwd>/<session id>/`, where the shell keeps the session's `plan.md`.
+/// Polls: the first turn creates it asynchronously.
+pub(crate) fn session_dir(content: &ContentController, harness: &mut PtyHarness) -> PathBuf {
+    let sessions = content.home().join(".grok").join("sessions");
+    for _ in 0..100 {
+        if let Ok(outer) = std::fs::read_dir(&sessions) {
+            for cwd_dir in outer.flatten() {
+                if let Ok(inner) = std::fs::read_dir(cwd_dir.path()) {
+                    for entry in inner.flatten() {
+                        if entry.path().is_dir() {
+                            return entry.path();
+                        }
+                    }
+                }
+            }
+        }
+        harness.update(Duration::from_millis(100));
+    }
+    panic!("no session dir under {}", sessions.display());
+}
 
 /// Spawn the pager in minimal mode against `content` at the default size.
 pub(crate) fn spawn_minimal(content: &ContentController) -> PtyHarness {
     spawn_minimal_sized(content, DEFAULT_ROWS, DEFAULT_COLS)
 }
 
-/// Spawn minimal at an explicit terminal size. A short terminal forces
-/// committed blocks into native scrollback sooner (less static space above the
-/// pinned live region).
+/// Spawn minimal at an explicit terminal size.
+/// A short terminal forces committed blocks into native scrollback sooner (less static space above the pinned live region).
 ///
-/// Response forwarding is enabled so the inline viewport's startup
-/// cursor-position query is answered — without it, `--minimal` silently
-/// downgrades to full-screen inline (the probe times out) and these tests would
-/// assert against the wrong render path.
+/// Response forwarding is enabled so the inline viewport's startup cursor-position query is answered.
+/// Without it, `--minimal` silently downgrades to full-screen inline (the probe times out).
+/// These tests would then assert against the wrong render path.
 pub(crate) fn spawn_minimal_sized(content: &ContentController, rows: u16, cols: u16) -> PtyHarness {
     let binary = pager_binary().expect("resolve pager binary");
     let mut harness = PtyHarness::spawn_with_content(&binary, rows, cols, content, MINIMAL_ARGS)
@@ -1049,11 +964,10 @@ pub(crate) fn spawn_minimal_sized(content: &ContentController, rows: u16, cols: 
     harness
 }
 
-/// Spawn minimal in an explicit project dir, appending `extra_args` to
-/// [`MINIMAL_ARGS`] (e.g. `--continue`). Sessions are keyed by cwd, so
-/// resume / new-session tests need a stable directory across runs. Query
-/// forwarding is enabled (as in [`spawn_minimal_sized`]) so the inline-viewport
-/// probe completes and minimal does not silently downgrade to full-screen inline.
+/// Spawn minimal in an explicit project dir, appending `extra_args` to [`MINIMAL_ARGS`] (e.g. `--continue`).
+/// Sessions are keyed by cwd, so resume / new-session tests need a stable directory across runs.
+/// Query forwarding is enabled (as in [`spawn_minimal_sized`]) so the inline-viewport probe completes.
+/// Minimal then does not silently downgrade to full-screen inline.
 pub(crate) fn spawn_minimal_in_dir(
     content: &ContentController,
     rows: u16,
@@ -1071,10 +985,8 @@ pub(crate) fn spawn_minimal_in_dir(
     harness
 }
 
-/// Block until minimal has cold-started into its agent session and is idle at
-/// the prompt (the `minimal · /help` status line is showing). Minimal has no
-/// welcome screen, so this — not [`WELCOME_SCREEN_SENTINEL`] — is the readiness
-/// gate.
+/// Block until minimal has cold-started into its agent session and is idle at the prompt (the `minimal · /help` status line is showing).
+/// Minimal has no welcome screen, so this, not [`WELCOME_SCREEN_SENTINEL`], is the readiness gate.
 pub(crate) fn wait_minimal_ready(harness: &mut PtyHarness) {
     harness
         .wait_for_text(MINIMAL_IDLE_SENTINEL, WELCOME_TIMEOUT)
@@ -1086,42 +998,105 @@ pub(crate) fn wait_minimal_ready(harness: &mut PtyHarness) {
         });
 }
 
-/// Quit minimal cleanly. The prompt is always focused (a bare `q` would type
-/// into it), so quit is Ctrl+Q pressed twice (it requires confirmation). Falls
-/// back to the harness kill path if the chord doesn't take.
+/// Quit minimal cleanly.
+/// The prompt is always focused (a bare `q` would type into it), so quit is Ctrl+Q pressed twice (it requires confirmation).
+/// Falls back to the harness kill path if the chord doesn't take.
+/// Give the confirm chord and process exit enough time under suite load.
+/// A SIGKILL must not cut off the agent mid-`updates.jsonl` flush, which breaks a subsequent `--continue` resume.
 pub(crate) fn quit_minimal(harness: &mut PtyHarness) {
-    let _ = harness.inject_keys(b"\x11"); // Ctrl+Q — arms the confirm
-    harness.update(Duration::from_millis(80));
-    let _ = harness.inject_keys(b"\x11"); // Ctrl+Q — confirms
-    if harness.wait_exit_code(Duration::from_secs(5)).is_none() {
-        let _ = harness.quit(); // kill fallback
+    let _ = harness.inject_keys(b"\x11"); // Ctrl+Q, first press (quit needs confirmation)
+    harness.update(Duration::from_millis(200));
+    let _ = harness.inject_keys(b"\x11"); // Ctrl+Q, second press confirms
+    match harness
+        .wait_exit_code(Duration::from_secs(15))
+        .expect("wait for minimal pager exit")
+    {
+        PtyExitPoll::Running => harness.quit().expect("kill minimal pager after timeout"),
+        PtyExitPoll::Exited(_) | PtyExitPoll::PendingStatus => {}
+    }
+}
+
+/// Write a local non-interactive editor script into `dir` and return the quoted command to hand to `$VISUAL`.
+/// Both bodies receive the draft path as their first argument.
+pub(crate) fn fake_editor_command(
+    dir: &std::path::Path,
+    unix_body: &str,
+    windows_body: &str,
+) -> String {
+    if cfg!(windows) {
+        let script = dir.join("local-editor.cmd");
+        std::fs::write(&script, windows_body).expect("write Windows editor script");
+        format!("cmd /C '{}'", script.display())
+    } else {
+        let script = dir.join("local-editor.sh");
+        std::fs::write(&script, unix_body).expect("write Unix editor script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+                .expect("make editor executable");
+        }
+        format!("'{}'", script.display())
+    }
+}
+
+const EXIT_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+fn resolve_exit_status_poll<T, E>(
+    poll: Result<PtyExitPoll<T>, E>,
+    deadline_reached: bool,
+) -> Result<Option<PtyExitPoll<T>>, E> {
+    match poll? {
+        PtyExitPoll::Exited(code) => Ok(Some(PtyExitPoll::Exited(code))),
+        state if deadline_reached => Ok(Some(state)),
+        PtyExitPoll::Running | PtyExitPoll::PendingStatus => Ok(None),
+    }
+}
+
+/// Wait for a concrete exit status while preserving the typed deadline state.
+pub(crate) fn wait_for_exit_status(
+    harness: &mut PtyHarness,
+    timeout: Duration,
+) -> anyhow::Result<PtyExitPoll<u32>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(state) = resolve_exit_status_poll(
+            harness.wait_exit_code(Duration::ZERO),
+            Instant::now() >= deadline,
+        )? {
+            return Ok(state);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        harness.update(EXIT_STATUS_POLL_INTERVAL.min(remaining));
+        let sleep_for =
+            Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now()));
+        if !sleep_for.is_zero() {
+            std::thread::sleep(sleep_for);
+        }
     }
 }
 
 // ── grok wrap e2e ───────────────────────────────────────────────────────
 
-/// `grok wrap` run budget. Same contention math as the requirements-version
-/// test: the child's cold exec of the huge debug binary can land its first
-/// write well past 30s under the parallel pty_e2e suite.
+/// `grok wrap` run budget.
+/// Same contention math as the requirements-version test.
+/// The child's cold exec of the huge debug binary can land its first write well past 30s under the parallel pty_e2e suite.
 #[cfg(unix)]
 pub(crate) const WRAP_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[cfg(unix)]
 const WRAP_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Run `grok wrap <wrap_args...>` to completion inside a PTY with an isolated
-/// `GROK_HOME`, returning the exit code (`None` if it never exited within
-/// [`WRAP_TIMEOUT`]) and everything the wrap PTY emitted. `extra_env` is where
-/// tests pin `SHELL`; wrap needs no mock content — it dispatches in `main`
-/// before auth/network/sandbox.
+/// Run `grok wrap <wrap_args...>` to completion inside a PTY with an isolated `GROK_HOME`.
+/// Returns the exit code (`None` only while still running at [`WRAP_TIMEOUT`]) and everything the wrap PTY emitted.
+/// `extra_env` is where tests pin `SHELL`; wrap needs no mock content (it dispatches in `main` before auth/network/sandbox).
 #[cfg(unix)]
 pub(crate) fn run_wrap(wrap_args: &[&str], extra_env: &[(&str, &str)]) -> (Option<u32>, String) {
     run_wrap_driving(wrap_args, extra_env, |_| {})
 }
 
-/// Like [`run_wrap`], but hands the live harness to `drive` right after spawn
-/// so a test can interact mid-run (wait for output, deliver signals to wrap
-/// itself) before the exit-and-drain phase.
+/// Like [`run_wrap`], but hands the live harness to `drive` right after spawn.
+/// A test can interact mid-run (wait for output, deliver signals to wrap itself) before the exit-and-drain phase.
 #[cfg(unix)]
 pub(crate) fn run_wrap_driving(
     wrap_args: &[&str],
@@ -1138,26 +1113,33 @@ pub(crate) fn run_wrap_driving(
     env.extend_from_slice(extra_env);
 
     let mut harness =
-        PtyHarness::new(&binary, DEFAULT_ROWS, DEFAULT_COLS, &args, &env).expect("spawn grok wrap");
+        PtyHarness::new_inherited_env(&binary, DEFAULT_ROWS, DEFAULT_COLS, &args, &env, None)
+            .expect("spawn grok wrap");
 
     drive(&mut harness);
 
-    let code = harness
-        .wait_for_exit_and_drain(WRAP_TIMEOUT, WRAP_DRAIN_TIMEOUT)
-        .ok();
-    if code.is_none() {
-        let _ = harness.quit(); // kill a hung child so the suite doesn't leak it
-    }
+    let code = match wait_for_exit_status(&mut harness, WRAP_TIMEOUT) {
+        Ok(PtyExitPoll::Exited(code)) => {
+            harness.update(WRAP_DRAIN_TIMEOUT);
+            Some(code)
+        }
+        Ok(PtyExitPoll::Running) => {
+            harness.quit().expect("kill grok wrap after timeout");
+            None
+        }
+        Ok(PtyExitPoll::PendingStatus) => {
+            panic!("grok wrap exited but portable status remained unavailable for {WRAP_TIMEOUT:?}")
+        }
+        Err(error) => panic!("poll grok wrap exit: {error:#}"),
+    };
 
     let raw = String::from_utf8_lossy(harness.raw_output()).into_owned();
     (code, raw)
 }
 
-/// Write an executable fake `$SHELL` that prints each argv element on its own
-/// `ARG:`-prefixed line and exits 0, so tests can assert the exact argv
-/// `grok wrap` hands to the user's shell without depending on any real
-/// shell's rc files or alias state. Keep the returned tempdir alive for the
-/// duration of the run.
+/// Write an executable fake `$SHELL` that prints each argv element on its own `ARG:`-prefixed line and exits 0.
+/// Tests can then assert the exact argv `grok wrap` hands to the user's shell without depending on any real shell's rc files or alias state.
+/// Keep the returned tempdir alive for the duration of the run.
 #[cfg(unix)]
 pub(crate) fn fake_argv_echo_shell() -> (tempfile::TempDir, String) {
     use std::os::unix::fs::PermissionsExt;
@@ -1198,9 +1180,8 @@ pub(crate) fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> b
     poll_for(timeout, || cond().then_some(())).is_some()
 }
 
-/// Dump assistant/tool/user messages (skipping the huge system prompt) from
-/// every request body, to inspect tool args / tool results / user queries in
-/// a failure message without printing megabytes of `{:#?}` bodies.
+/// Dump assistant/tool/user messages (skipping the huge system prompt) from every request body.
+/// Lets a failure message show tool args / tool results / user queries without printing megabytes of `{:#?}` bodies.
 #[cfg(unix)]
 pub(crate) fn dump_non_system_messages(bodies: &[serde_json::Value]) -> String {
     let mut out = String::new();
@@ -1224,8 +1205,7 @@ pub(crate) fn dump_non_system_messages(bodies: &[serde_json::Value]) -> String {
     out
 }
 
-/// Extract the runtime task id from a serialized request body containing the
-/// background-start tool result's `<task-id>…</task-id>` envelope.
+/// Extract the runtime task id from a serialized request body containing the background-start tool result's `<task-id>…</task-id>` envelope.
 #[cfg(unix)]
 pub(crate) fn extract_task_id(body: &str) -> Option<String> {
     let start = body.find("<task-id>")? + "<task-id>".len();
@@ -1235,9 +1215,8 @@ pub(crate) fn extract_task_id(body: &str) -> Option<String> {
     (!id.is_empty()).then(|| id.to_string())
 }
 
-/// Dump an asciinema cast of `harness` into `$GROK_PTY_CAST_DIR/<file_name>`
-/// when the env var is set. Failures are logged, never fatal — the cast is a
-/// diagnostic artifact, not part of the assertion surface.
+/// Dump an asciinema cast of `harness` into `$GROK_PTY_CAST_DIR/<file_name>` when the env var is set.
+/// Failures are logged, never fatal: the cast is a diagnostic artifact, not part of what the test asserts.
 #[cfg(unix)]
 pub(crate) fn write_cast_if_requested(harness: &PtyHarness, file_name: &str) {
     let Ok(dir) = std::env::var("GROK_PTY_CAST_DIR") else {
@@ -1253,20 +1232,44 @@ pub(crate) fn write_cast_if_requested(harness: &PtyHarness, file_name: &str) {
     }
 }
 
+/// Dump the current screen (plain text and HTML) into `$GROK_PTY_CAST_DIR/<file_stem>.{txt,html}` when the env var is set.
+/// Failures are logged, never fatal; same opt-in as [`write_cast_if_requested`].
+pub(crate) fn write_screen_dump_if_requested(harness: &PtyHarness, file_stem: &str) {
+    let Ok(dir) = std::env::var("GROK_PTY_CAST_DIR") else {
+        return;
+    };
+    if dir.is_empty() {
+        return;
+    }
+    let dir = std::path::PathBuf::from(dir);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("failed to create dump dir {}: {e}", dir.display());
+        return;
+    }
+    for (ext, body) in [
+        ("txt", harness.screen_contents()),
+        ("html", harness.screen_html()),
+    ] {
+        let path = dir.join(format!("{file_stem}.{ext}"));
+        match std::fs::write(&path, body) {
+            Ok(()) => eprintln!("wrote screen dump: {}", path.display()),
+            Err(e) => eprintln!("failed to write screen dump {}: {e}", path.display()),
+        }
+    }
+}
+
 // ── Clipboard paste e2e tests ───────────────────────────────────────────
 
-/// Serialized `content` of every user message across recorded requests, in
-/// order. Like [`all_user_messages`] but multimodal-tolerant: array-form
-/// content (e.g. text plus an image block attached from a macOS dev machine's
-/// real clipboard during a paste test) serializes to its JSON string instead
-/// of vanishing, so contains-style sentinel asserts keep working.
+/// Serialized `content` of every user message across recorded requests, in order.
+/// Like [`all_user_messages`] but multimodal-tolerant: array-form content serializes to its JSON string instead of vanishing.
+/// That keeps contains-style sentinel asserts working.
+/// (E.g. text plus an image block attached from a macOS dev machine's real clipboard during a paste test.)
 pub(crate) fn all_user_message_blobs(content: &ContentController) -> Vec<String> {
     content
         .request_bodies()
         .iter()
         .flat_map(|b| {
-            // Chat Completions carries `messages`; the Responses shape carries
-            // the same role/content layout under `input`.
+            // Chat Completions carries `messages`; the Responses shape carries the same role/content layout under `input`
             let items = b["messages"].as_array().or_else(|| b["input"].as_array());
             items
                 .into_iter()
@@ -1281,16 +1284,46 @@ pub(crate) fn all_user_message_blobs(content: &ContentController) -> Vec<String>
         .collect()
 }
 
-// The `paste_ctrl_v_*_{macos,windows}` tests drive the REAL host clipboard
-// via the harness's shared `host_clipboard` plumbing (pbcopy/osascript on
-// macOS, PowerShell on Windows), so they are OS-native and mutate the
-// machine-global clipboard; they hold `#[serial_test::serial(host_clipboard)]`
-// so two clipboard tests never interleave within one test process.
+// The `paste_ctrl_v_*_{macos,windows}` tests drive the REAL host clipboard via the harness's shared `host_clipboard` helpers
+// They are OS-native and mutate the machine-global clipboard (pbcopy/osascript on macOS, PowerShell on Windows)
+// They hold `#[serial_test::serial(host_clipboard)]` so two clipboard tests never interleave within one test process
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub(crate) use xai_grok_pager_pty_harness::host_clipboard::{
     HostClipboardTextGuard, pbcopy, set_clipboard_png, write_fixture_png,
 };
-// Windows CI sessions may lack a usable clipboard; the windows twins gate on
-// this and SKIP instead of failing on environment.
+// Windows CI sessions may lack a usable clipboard; the windows twins gate on this and SKIP instead of failing on environment
 #[cfg(target_os = "windows")]
 pub(crate) use xai_grok_pager_pty_harness::host_clipboard::clipboard_roundtrip_works;
+
+#[cfg(test)]
+mod exit_status_wait_policy_tests {
+    use super::*;
+
+    #[test]
+    fn waits_for_running_and_pending_until_deadline_and_propagates_errors() {
+        assert_eq!(
+            resolve_exit_status_poll::<u32, &'static str>(Ok(PtyExitPoll::Exited(2)), false),
+            Ok(Some(PtyExitPoll::Exited(2)))
+        );
+        assert_eq!(
+            resolve_exit_status_poll::<u32, &'static str>(Ok(PtyExitPoll::Running), false),
+            Ok(None)
+        );
+        assert_eq!(
+            resolve_exit_status_poll::<u32, &'static str>(Ok(PtyExitPoll::PendingStatus), false),
+            Ok(None)
+        );
+        assert_eq!(
+            resolve_exit_status_poll::<u32, &'static str>(Ok(PtyExitPoll::Running), true),
+            Ok(Some(PtyExitPoll::Running))
+        );
+        assert_eq!(
+            resolve_exit_status_poll::<u32, &'static str>(Ok(PtyExitPoll::PendingStatus), true),
+            Ok(Some(PtyExitPoll::PendingStatus))
+        );
+        assert_eq!(
+            resolve_exit_status_poll::<u32, &'static str>(Err("poll failed"), true),
+            Err("poll failed")
+        );
+    }
+}
