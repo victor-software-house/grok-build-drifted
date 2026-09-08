@@ -1,22 +1,19 @@
-//! Compaction methods for `SessionActor`.
-//!
-//! This module contains all compaction-related methods: manual `/compact`,
-//! auto-compact threshold checks, inline auto-compact with auto-continue,
-//! error-recovery compaction, preflight overflow detection, and checkpoint
-//! persistence. These methods form a second `impl SessionActor` block that
-//! lives alongside the primary one in `acp_session.rs`.
+//! This module contains all compaction methods: manual `/compact`, auto-compact threshold checks, and inline auto-compact with auto-continue.
+//! It also holds error-recovery compaction, preflight overflow detection, and checkpoint persistence.
+//! These methods form a second `impl SessionActor` block that lives alongside the primary one in `acp_session.rs`.
 use super::SessionActor;
 use super::is_project_instructions;
 use crate::remote::DEFAULT_CONTEXT_WINDOW;
 use crate::session::compaction_config::{
-    AsyncCompactionCache, SUPPRESS_NONE, SUPPRESS_STICKY, SUPPRESS_TURN, SUPPRESS_UNTIL_SUCCESS,
+    AsyncCompactionCache, SUPPRESS_AUTH, SUPPRESS_NONE, SUPPRESS_STICKY, SUPPRESS_TURN,
+    SUPPRESS_UNTIL_SUCCESS,
 };
 use crate::session::helpers::CompactionStateContext;
 use crate::session::helpers::compaction_context::CompactionInputs;
 use crate::session::helpers::compaction_context::to_system_reminder;
 use crate::session::helpers::session_compact::{
-    CompactOutput, CompactionOutcome, build_compaction_chat_history,
-    build_two_pass_compaction_prompt, generate_session_compact, is_context_length_error,
+    COMPACT_FAILED_PREFIX, CompactOutput, CompactionOutcome, build_two_pass_compaction_prompt,
+    generate_session_compact, is_context_length_error,
 };
 use crate::session::persistence::PersistenceMsg;
 use crate::session::two_pass::{
@@ -31,8 +28,32 @@ use xai_chat_state::compaction_utils::{
     validate_compacted_history,
 };
 use xai_grok_sampling_types::{ApiBackend, ConversationItem};
-/// Default percentage points below the auto-compact threshold at which prefire
-/// (background pass-1) starts, giving pass-1 runway to finish before the limit.
+/// Prefix on the early-guard failure payloads below; the user-facing normalizer strips it (the renderer prepends its own headline).
+const COMPACTION_FAILED_GUARD_PREFIX: &str = "Compaction failed: ";
+/// Human-readable "next fire" for a scheduled loop in the compaction reminder.
+fn format_loop_next_fire(
+    next: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let secs = next.signed_duration_since(now).num_seconds();
+    if secs <= 0 {
+        return "now".to_string();
+    }
+    if secs < 60 {
+        return format!("in {secs}s");
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("in {mins}m");
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return format!("in {hours}h");
+    }
+    next.format("%d %b %H:%M UTC").to_string()
+}
+/// Default percentage points below the auto-compact threshold at which prefire (background pass-1) starts.
+/// The lead gives pass-1 runway to finish before the limit.
 /// Override with `GROK_PREFIRE_LEAD_PERCENT`.
 const DEFAULT_PREFIRE_LEAD_PERCENT: u64 = 10;
 fn prefire_lead_percent() -> u64 {
@@ -41,9 +62,9 @@ fn prefire_lead_percent() -> u64 {
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(DEFAULT_PREFIRE_LEAD_PERCENT)
 }
-/// Cheap fingerprint of a conversation prefix for prefire NOTE₁ validity. A
-/// mismatch means the prefix changed (edit / rewind / branch) since pass-1, so
-/// the cached NOTE₁ no longer summarizes the current prefix and must be dropped.
+/// Cheap fingerprint of a conversation prefix for prefire NOTE₁ validity.
+/// A mismatch means the prefix changed (edit / rewind / branch) since pass-1.
+/// The cached NOTE₁ then no longer summarizes the current prefix and must be dropped.
 fn fingerprint_prefix(items: &[ConversationItem]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -62,10 +83,8 @@ fn fingerprint_prefix(items: &[ConversationItem]) -> u64 {
     }
     h.finish()
 }
-/// Outcome of a background prefire pass-1 run, recorded on the
-/// `session.prefire_pass1` span as `compaction_prefire_outcome`.
-/// [`PrefireOutcome::as_str`] values are stable telemetry keys
-/// (telemetry/dashboards key off them) — don't rename the strings.
+/// Outcome of a background prefire pass-1 run, recorded on the `session.prefire_pass1` span as `compaction_prefire_outcome`.
+/// [`PrefireOutcome::as_str`] values are stable telemetry keys (telemetry/dashboards key off them); don't rename the strings.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PrefireOutcome {
     Cached,
@@ -89,9 +108,8 @@ impl PrefireOutcome {
         }
     }
 }
-/// Telemetry from one prefire pass-1 run; recorded onto the
-/// `session.prefire_pass1` span by [`SessionActor::run_prefire_pass1`].
-/// `None` fields = the run exited before that stage.
+/// Telemetry from one prefire pass-1 run; recorded onto the `session.prefire_pass1` span by [`SessionActor::run_prefire_pass1`].
+/// A `None` field means the run exited before that stage.
 struct PrefirePass1Run {
     outcome: PrefireOutcome,
     prefix_len: Option<usize>,
@@ -100,7 +118,6 @@ struct PrefirePass1Run {
     note1_chars: Option<usize>,
 }
 impl From<PrefireOutcome> for PrefirePass1Run {
-    /// A run that exited before splitting/sampling — outcome only.
     fn from(outcome: PrefireOutcome) -> Self {
         Self {
             outcome,
@@ -112,93 +129,43 @@ impl From<PrefireOutcome> for PrefirePass1Run {
     }
 }
 #[cfg(test)]
-mod two_pass_prefire_helper_tests {
-    use super::{fingerprint_prefix, prefire_lead_percent};
-    use xai_grok_sampling_types::ConversationItem;
-    #[test]
-    fn fingerprint_stable_for_same_prefix() {
-        let items = vec![
-            ConversationItem::system("sys"),
-            ConversationItem::user("hello"),
-            ConversationItem::assistant("hi"),
-        ];
-        assert_eq!(fingerprint_prefix(&items), fingerprint_prefix(&items));
-    }
-    #[test]
-    fn fingerprint_changes_when_prefix_content_changes() {
-        let base = vec![
-            ConversationItem::system("sys"),
-            ConversationItem::user("hello"),
-        ];
-        let edited = vec![
-            ConversationItem::system("sys"),
-            ConversationItem::user("HELLO there"),
-        ];
-        assert_ne!(
-            fingerprint_prefix(&base),
-            fingerprint_prefix(&edited),
-            "a changed prefix must invalidate the cached NOTE1 fingerprint"
-        );
-    }
-    #[test]
-    fn fingerprint_changes_with_length() {
-        let short = vec![ConversationItem::user("a")];
-        let long = vec![
-            ConversationItem::user("a"),
-            ConversationItem::assistant("b"),
-        ];
-        assert_ne!(fingerprint_prefix(&short), fingerprint_prefix(&long));
-    }
-    #[test]
-    fn prefire_lead_percent_defaults_to_10() {
-        unsafe { std::env::remove_var("GROK_PREFIRE_LEAD_PERCENT") };
-        assert_eq!(prefire_lead_percent(), 10);
-    }
-}
+#[path = "compaction_two_pass_prefire_helper_tests.rs"]
+mod two_pass_prefire_helper_tests;
 impl SessionActor {
-    /// Two-pass active for this session: flag resolved on at build AND not an
-    /// agent that keeps its single short self-summary.
+    /// Two-pass is active for this session when the flag resolved on at build and the agent is not one that keeps its single short self-summary.
     pub(crate) fn two_pass_active(&self) -> bool {
         let agent = self.agent.borrow();
         agent.compaction_policy().two_pass_enabled
     }
-    /// Run one summarization sample over a fully-built two-pass history (the
-    /// prompt is already embedded, so this bypasses the single-pass sampler and
-    /// calls `generate_session_compact` directly). Returns `None` on any error
-    /// so callers fall back to single-pass.
+    /// Run one summarization sample over a fully-built two-pass history.
+    /// The prompt is already embedded, so this bypasses the single-pass sampler and calls `generate_session_compact` directly.
+    /// Returns `None` on any error so callers fall back to single-pass.
     ///
-    /// Agent `RefCell` borrows are only taken for synchronous snapshots (never
-    /// held across `.await`). Prefire is `spawn_local` on the same LocalSet as
-    /// the turn loop; a long-lived borrow would race with turn/compact/cancel
-    /// and panic on double-borrow.
+    /// Agent `RefCell` borrows are only taken for synchronous snapshots (never held across `.await`).
+    /// Prefire is `spawn_local` on the same LocalSet as the turn loop.
+    /// A long-lived borrow would race with turn/compact/cancel and panic on double-borrow.
     async fn two_pass_sample(&self, history: Vec<ConversationItem>) -> Option<CompactOutput> {
         let sampling_config = self.reconstruct_full_config().await;
         let client = match self.prepare_chat_completion(false).await {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!(
-                    error = % e, "two_pass: failed to prepare sampling client"
-                );
+                tracing::warn!(error = %e, "two_pass: failed to prepare sampling client");
                 return None;
             }
         };
         let tool_defs = self.prepare_tool_definitions().await;
         let tools = self.turn_base_tool_specs(&tool_defs);
-        let (hosted_tools, wall_clock_budget_secs) = {
-            let agent = self.agent.borrow();
-            let use_backend_search =
-                agent.backend_search_enabled() && self.supports_backend_search.get();
-            (
-                if use_backend_search {
-                    agent.hosted_tools().to_vec()
-                } else {
-                    Vec::new()
-                },
-                agent.compaction_policy().wall_clock_budget_secs,
-            )
-        };
+        let compaction_tool_tokens = xai_chat_state::estimate_tool_specs_tokens(&tools);
+        let wall_clock_budget_secs = self
+            .agent
+            .borrow()
+            .compaction_policy()
+            .wall_clock_budget_secs;
+        let hosted_tools = self.hosted_tools_for_turn();
+        let (cancel, _cancel_scope) = self.compaction.cancel.enter();
         match generate_session_compact(
             history,
+            compaction_tool_tokens,
             tools,
             hosted_tools,
             client,
@@ -207,19 +174,25 @@ impl SessionActor {
             self.inference_idle_timeout,
             wall_clock_budget_secs,
             self.compaction.tool_choice,
+<<<<<<< HEAD
+=======
+            &cancel,
+>>>>>>> 72a61251fcffb464bcc687aeb5a998e5a98ec0c9
         )
         .await
         {
             Ok(out) => Some(out),
             Err(e) => {
-                tracing::warn!(error = ? e, "two_pass: summarization sample failed");
+                tracing::warn!(error = ?e, "two_pass: summarization sample failed");
                 None
             }
         }
     }
-    /// Per-turn prefire decision: usage has reached `threshold - lead` (so there
-    /// is still runway before the hard auto-compact line at `threshold`).
+    /// Per-turn prefire decision: usage has reached `threshold - lead` (so there is still runway before the hard auto-compact line at `threshold`).
     pub(crate) async fn should_prefire_two_pass(&self) -> bool {
+        if self.compaction.is_suppressed() {
+            return false;
+        }
         let sampling_cfg = self.chat_state_handle.get_sampling_config().await;
         let Some(cw) = sampling_cfg.as_ref().map(|c| c.context_window.get()) else {
             return false;
@@ -229,11 +202,10 @@ impl SessionActor {
         let start_pct = threshold.saturating_sub(prefire_lead_percent());
         xai_token_estimation::exceeds_threshold(estimated_total, cw, start_pct as u8)
     }
-    /// Background pass-1: summarize the ~95% prefix → NOTE₁ and cache it for a
-    /// later pass-2 apply. Always releases the in-flight guard. Spawned via
-    /// `spawn_local` from the turn loop; reads a conversation snapshot and does
-    /// not mutate session state. The span makes speculative pass-1 spend
-    /// measurable (hit rate, wasted input tokens) ahead of the fleet-wide ramp.
+    /// Background pass-1: summarize the ~95% prefix into NOTE₁ and cache it for a later pass-2 apply.
+    /// Always releases the in-flight guard.
+    /// Spawned via `spawn_local` from the turn loop; reads a conversation snapshot and does not mutate session state.
+    /// The span makes speculative pass-1 spend measurable (hit rate, wasted input tokens) ahead of the fleet-wide ramp.
     #[tracing::instrument(
         name = "session.prefire_pass1",
         skip_all,
@@ -278,7 +250,7 @@ impl SessionActor {
             .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
         {
             tracing::info!(
-                target : "two_pass",
+                target: "two_pass",
                 "two_pass: DEBUG GROK_DEBUG_TWO_PASS_FAIL_PASS1 — prefire pass1 produces no cache"
             );
             return PrefireOutcome::DebugFailPass1.into();
@@ -334,26 +306,23 @@ impl SessionActor {
             pass1_latency_ms,
         };
         tracing::info!(
-            target : "two_pass", prefix_len = cache.prefix_len, pass1_latency_ms = cache
-            .pass1_latency_ms, "two_pass: prefire pass1 cached NOTE1"
+            target: "two_pass",
+            prefix_len = cache.prefix_len,
+            pass1_latency_ms = cache.pass1_latency_ms,
+            "two_pass: prefire pass1 cached NOTE1"
         );
         self.compaction.prefire.store(cache);
         attempted(PrefireOutcome::Cached, Some(note1_chars))
     }
-    /// Pass-2 apply: if a valid cached NOTE₁ exists for the current conversation,
-    /// summarize (NOTE₁ + recent tail + special prompt) → final summary and
-    /// return its `CompactOutput`. `None` → caller runs the single-pass path.
+    /// Pass-2 apply: summarize the cached NOTE₁, the recent tail, and the special prompt into the final summary and return its `CompactOutput`.
+    /// Runs only when a valid cached NOTE₁ exists for the current conversation.
+    /// Returning `None` means the caller runs the single-pass path.
     ///
-    /// **telemetry / `session.compact_inner` latency:** the returned `CompactOutput`
-    /// stream timings are what land on `compaction_ttft_ms` /
-    /// `compaction_stream_ms`. Those reflect **user-visible sync wait only**:
-    /// - background pass-1 that already finished before compact is *not*
-    ///   included (prefire hid that cost);
-    /// - if pass-1 is still in flight we **do** add that await into
-    ///   `ttft_ms` (time until first token of the final summary), because the
-    ///   user is blocked on it;
-    /// - `stream_ms` / `delta_count` / `itl_max_ms` are always pass-2 only
-    ///   (the only sample that streams the successor-visible summary).
+    /// **telemetry:** the returned `CompactOutput` stream timings land on `compaction_ttft_ms` / `compaction_stream_ms` (`session.compact_inner`).
+    /// Those reflect **user-visible sync wait only**:
+    /// - background pass-1 that already finished before compact is *not* included (prefire hid that cost);
+    /// - if pass-1 is still in flight we **do** add that await into `ttft_ms` (first token of the final summary), because the user is blocked on it;
+    /// - `stream_ms` / `delta_count` / `itl_max_ms` are always pass-2 only (the only sample that streams the successor-visible summary).
     async fn try_two_pass_pass2_apply(
         &self,
         user_context: Option<&str>,
@@ -372,7 +341,8 @@ impl SessionActor {
                 tracing::Span::current()
                     .record("compaction_prefire_waited_ms", prefire_waited_ms as i64);
                 tracing::info!(
-                    target : "two_pass", wait_ms = prefire_waited_ms,
+                    target: "two_pass",
+                    wait_ms = prefire_waited_ms,
                     "two_pass: waited for in-flight prefire pass1 before pass2"
                 );
             }
@@ -392,7 +362,7 @@ impl SessionActor {
         {
             tracing::Span::current().record("compaction_prefire_stale", true);
             tracing::info!(
-                target : "two_pass",
+                target: "two_pass",
                 "two_pass: cached NOTE1 stale or model changed; falling back to single-pass"
             );
             return None;
@@ -409,7 +379,7 @@ impl SessionActor {
         if is_degenerate_summary(&out.content) {
             tracing::Span::current().record("compaction_prefire_stale", true);
             tracing::info!(
-                target : "two_pass",
+                target: "two_pass",
                 "two_pass: pass2 summary empty/degenerate; falling back to single-pass"
             );
             return None;
@@ -423,22 +393,28 @@ impl SessionActor {
         span.record("compaction_prefire_hit", true);
         span.record("compaction_pass2_latency_ms", pass2_latency_ms as i64);
         tracing::info!(
-            target : "two_pass", prefix_len = cache.prefix_len, tail_len = tail.len(),
-            prefire_waited_ms, pass2_latency_ms, pass1_bg_latency_ms = cache
-            .pass1_latency_ms, "two_pass: pass2 applied cached NOTE1 (prefire hit)"
+            target: "two_pass",
+            prefix_len = cache.prefix_len,
+            tail_len = tail.len(),
+            prefire_waited_ms,
+            pass2_latency_ms,
+            pass1_bg_latency_ms = cache.pass1_latency_ms,
+            "two_pass: pass2 applied cached NOTE1 (prefire hit)"
         );
         Some(out)
     }
 }
-/// Trigger info for auto-compact decisions.
 pub(crate) struct AutoCompactTriggerInfo {
     pub tokens_used: u64,
     pub context_window: u64,
     pub percentage: u8,
 }
+/// The "always fits" lossy summarization budget (~70% of window, minus tool definitions); shared by the ladder's Lossy step and the cold Lossy start.
+fn lossy_input_budget(context_window: u64, tool_tokens: u64) -> u64 {
+    (context_window.saturating_mul(7) / 10).saturating_sub(tool_tokens)
+}
 /// Why auto-compaction was suppressed after a deterministic failure.
-/// [`SuppressReason::as_str`] is a stable telemetry value (BQ/OTLP/dashboards key
-/// off it) — don't rename the strings.
+/// [`SuppressReason::as_str`] is a stable telemetry value (BQ/OTLP/dashboards key off it); don't rename the strings.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SuppressReason {
     CreditBlock,
@@ -458,23 +434,21 @@ impl SuppressReason {
         }
     }
     /// Suppression scope for this reason:
-    /// - `size | schema` → [`SUPPRESS_STICKY`]: retrying the same conversation
-    ///   can't help; cleared only on a context-budget change.
-    /// - `credit_block | auth` → [`SUPPRESS_UNTIL_SUCCESS`]: re-sending fails the
-    ///   same way every turn until the user acts, so don't clear per-turn — wait
-    ///   for an actual successful model call (a `200` proves recovery).
-    /// - `other` → [`SUPPRESS_TURN`]: optimistic per-turn retry.
+    /// - `size` and `schema` get [`SUPPRESS_STICKY`]: cleared only on a context-budget change.
+    /// - `credit_block` gets [`SUPPRESS_UNTIL_SUCCESS`]: wait for a model `200`.
+    /// - `auth` gets [`SUPPRESS_AUTH`]: cleared on login/token refresh, not on a `200` (an over-window session never gets one).
+    /// - `other` gets [`SUPPRESS_TURN`]: optimistic per-turn retry.
     fn suppress_state(self) -> u8 {
         match self {
             SuppressReason::Size | SuppressReason::Schema => SUPPRESS_STICKY,
-            SuppressReason::CreditBlock | SuppressReason::Auth => SUPPRESS_UNTIL_SUCCESS,
+            SuppressReason::CreditBlock => SUPPRESS_UNTIL_SUCCESS,
+            SuppressReason::Auth => SUPPRESS_AUTH,
             SuppressReason::Other => SUPPRESS_TURN,
         }
     }
 }
-/// Splice the preserved prefix (`conversation[0..prefix_len]`) onto the compacted
-/// suffix, dropping the suffix's leading System and — if the prefix already has an
-/// AGENTS.md item — its re-injected AGENTS.md too (else the model sees it twice).
+/// Splice the preserved prefix (`conversation[0..prefix_len]`) onto the compacted suffix, dropping the suffix's leading System.
+/// If the prefix already has an AGENTS.md item, drop the suffix's re-injected AGENTS.md too (else the model sees it twice).
 /// Returns `Err(compacted_history)` unchanged when `prefix_len` is 0 or out of range.
 fn preserve_inherited_prefix(
     conversation: &[ConversationItem],
@@ -494,16 +468,12 @@ fn preserve_inherited_prefix(
     preserved.extend(child_items);
     Ok(preserved)
 }
-/// Project the token count a re-pinned (preserved) history would reseed to, so the
-/// release decision compares against the same threshold the auto-compact trigger
-/// applies next turn. This only APPROXIMATES the compaction reseed
-/// (`xai-chat-state` `replace_conversation`, the authority): it matches the reseed's
-/// round-and-cap but divides by the current conversation estimate, not the reseed's
-/// frozen `estimate_at_last_response`. The conversation only grows, so the current
-/// estimate is >= that frozen value; this therefore under-estimates the reseed (a
-/// lower bound) and can lean toward preserve. That never re-loops: the post-replace
-/// `exceeds_threshold` check on the real reseeded total still sets sticky Size
-/// suppression if a preserve leaves the fork over budget.
+/// Project the token count a re-pinned (preserved) history would reseed to.
+/// The release decision then compares against the same threshold the auto-compact trigger applies next turn.
+/// This only APPROXIMATES the reseed done by `xai-chat-state` `replace_conversation`, the authority.
+/// It divides by the current conversation estimate, not the reseed's frozen `estimate_at_last_response`.
+/// The conversation only grows, so this under-estimates the reseed (a lower bound) and can lean toward preserve.
+/// That never re-loops: the post-replace `exceeds_threshold` check still sets sticky Size suppression if a preserve leaves the fork over budget.
 fn project_preserved_reseed_tokens(
     preserved_estimate: u64,
     tokens_before: u64,
@@ -513,16 +483,16 @@ fn project_preserved_reseed_tokens(
     ((preserved_estimate as f64 * ratio).round() as u64).min(tokens_before)
 }
 impl SessionActor {
+    /// Where the transcript would be, without asking the filesystem: callers on a hot path do the `exists()` themselves, off the actor's thread.
+    pub(crate) fn transcript_path(&self) -> std::path::PathBuf {
+        crate::session::persistence::session_dir(&self.session_info).join("updates.jsonl")
+    }
     /// Path to the raw `updates.jsonl` transcript if it exists, else `None`.
-    /// `pub(crate)` so the `Transcript`-mode dispatch in `compaction_segments`
-    /// and transcript-location pointers can both reuse it.
+    /// `pub(crate)` so the `Transcript`-mode dispatch in `compaction_segments` and transcript-location pointers can both reuse it.
     ///
-    /// The `path.exists()` guard keeps the pointer safe when a session (e.g. a
-    /// nested sub-agent) never wrote one -- the hint is simply omitted rather
-    /// than dangling.
+    /// The `path.exists()` guard keeps the pointer safe when a session (e.g. a nested sub-agent) never wrote one.
     pub(crate) fn get_transcript_path(&self) -> Option<String> {
-        let path =
-            crate::session::persistence::session_dir(&self.session_info).join("updates.jsonl");
+        let path = self.transcript_path();
         if path.exists() {
             Some(path.to_string_lossy().into_owned())
         } else {
@@ -531,8 +501,7 @@ impl SessionActor {
     }
     /// Increment the compaction counter and launch a pre-compaction memory flush.
     ///
-    /// The counter is incremented before the flush check so the once-per-cycle
-    /// guard does not suppress the first eligible flush.
+    /// The counter is incremented before the flush check so the once-per-cycle guard does not suppress the first eligible flush.
     async fn maybe_pre_compaction_flush(
         self: &Arc<Self>,
         total_tokens: u64,
@@ -551,7 +520,7 @@ impl SessionActor {
             .memory
             .last_flush_compaction
             .load(std::sync::atomic::Ordering::Relaxed);
-        if crate::session::helpers::memory_flush::should_flush(
+        if xai_grok_memory::flush::should_flush(
             total_tokens,
             context_window,
             self.compaction.threshold_percent.get(),
@@ -573,8 +542,7 @@ impl SessionActor {
             });
         }
     }
-    /// Tag the current `session.compact` span with `mode` (and `detail`, for
-    /// `segments`) — the A/B variant key for grouping outcomes in telemetry.
+    /// Tag the current `session.compact` span with `mode` (and `detail`, for `segments`), the A/B variant key for grouping outcomes in telemetry.
     fn record_compaction_variant(&self) {
         let mode = self.compaction.compaction_mode;
         let span = tracing::Span::current();
@@ -583,8 +551,7 @@ impl SessionActor {
             span.record("detail", tracing::field::display(detail));
         }
     }
-    /// Runs the compact operation over here which compresses the current conversation
-    /// and helps with saving the context for the model
+    /// Handle a manual `/compact`: summarize the conversation so the context shrinks.
     #[tracing::instrument(
         name = "session.compact",
         skip_all,
@@ -603,6 +570,7 @@ impl SessionActor {
         self: &Arc<Self>,
         user_context: Option<String>,
     ) -> Result<(), acp::Error> {
+        let (_cancel, _cancel_scope) = self.compaction.cancel.enter();
         self.record_compaction_variant();
         let total_tokens = self.chat_state_handle.get_total_tokens().await;
         tracing::Span::current().record("pre_tokens", total_tokens as i64);
@@ -618,13 +586,20 @@ impl SessionActor {
                 user_context,
                 None,
                 xai_grok_telemetry::events::CompactionTrigger::Manual,
+                false,
             )
             .await
         {
             let span = tracing::Span::current();
             span.record("success", false);
             span.record("error", e.to_string().as_str());
-            return Err(e);
+            let kind = crate::session::helpers::session_compact::compact_error_kind(&e)
+                .unwrap_or(crate::session::helpers::session_compact::CompactErrorKind::Failed);
+            let detail =
+                Self::user_facing_compact_error(&crate::sampling::error::acp_error_message(&e));
+            return Err(e.data(
+                crate::session::helpers::session_compact::compact_error_data(kind, &detail),
+            ));
         }
         use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
         let tokens_after = self.chat_state_handle.get_total_tokens().await;
@@ -638,16 +613,27 @@ impl SessionActor {
             summary_preview: None,
         })
         .await;
+        self.emit_status_snapshot_detached();
         Ok(())
     }
-    /// Suppress AUTO compaction after a deterministic failure so the gates stop
-    /// re-firing a doomed compaction. Scope depends on the reason (see
-    /// [`SuppressReason::suppress_state`]): size/schema are sticky, credit/auth
-    /// hold until a model call succeeds, other clears next turn. Fires telemetry +
-    /// one notification per transition; manual `/compact` is exempt.
+    async fn emit_compact_cancelled(&self, auto_trigger: bool) -> Result<(), acp::Error> {
+        if auto_trigger {
+            use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
+            self.send_xai_notification(XaiSessionUpdate::AutoCompactCancelled {
+                reason: crate::extensions::notification::AutoCompactCancelReason::UserCancelled,
+            })
+            .await;
+        }
+        Err(crate::session::helpers::session_compact::CompactFailure::cancelled_error())
+    }
+    /// Suppress AUTO compaction after a deterministic failure.
+    /// Scope depends on the reason (see [`SuppressReason::suppress_state`]).
+    /// Emits telemetry and one notification per transition; manual `/compact` is exempt.
+    /// Only `Other` shows `detail`; the canned reasons are already actionable.
     async fn suppress_auto_compaction(
         &self,
         reason: SuppressReason,
+        detail: &str,
         estimated_tokens: u64,
         context_window: u64,
     ) {
@@ -676,29 +662,42 @@ impl SessionActor {
                     context_window,
                 },
             );
-            let message = match reason {
-                SuppressReason::CreditBlock => {
-                    "out of credits or over your spending limit. Add credits and retry."
-                }
-                SuppressReason::Auth => {
-                    "authentication problem — re-authenticate using /login and retry."
-                }
-                SuppressReason::Size => "this conversation is too large to compact.",
-                SuppressReason::Schema => "this conversation can't be summarized.",
-                SuppressReason::Other => {
-                    "it'll retry on the next turn, or start a new session using /new."
-                }
-            };
             self.send_xai_notification(
                 crate::extensions::notification::SessionUpdate::AutoCompactFailed {
-                    error: message.to_string(),
+                    error: Self::suppress_notification_message(reason, detail),
                 },
             )
             .await;
         }
     }
-    /// Map a deterministic failure's error text to a fixed, content-free
-    /// [`SuppressReason`] (drives telemetry + sticky-vs-per-turn scope).
+    /// Text for the suppression notification, canned per reason; `Other` carries the real error.
+    /// Starts lowercase; the renderer prepends its own headline.
+    fn suppress_notification_message(reason: SuppressReason, detail: &str) -> String {
+        match reason {
+            SuppressReason::CreditBlock => {
+                "out of credits or over your spending limit. Add credits and retry.".to_string()
+            }
+            SuppressReason::Auth => {
+                "authentication problem — re-authenticate using /login and retry.".to_string()
+            }
+            SuppressReason::Size => "this conversation is too large to compact.".to_string(),
+            SuppressReason::Schema => "this conversation can't be summarized.".to_string(),
+            SuppressReason::Other => Self::failure_with_retry_guidance(detail),
+        }
+    }
+    /// Retry/new-session guidance headline, normalized detail on its own line.
+    /// Shared by the `Other` suppress arm and the transient failure; both retry on the next turn.
+    fn failure_with_retry_guidance(detail: &str) -> String {
+        const RETRY_GUIDANCE: &str =
+            "it'll retry on the next turn, or start a new session using /new.";
+        let detail = Self::user_facing_compact_error(detail);
+        if detail.is_empty() {
+            RETRY_GUIDANCE.to_string()
+        } else {
+            format!("{RETRY_GUIDANCE}\n{detail}")
+        }
+    }
+    /// Map a deterministic failure's error text to a fixed, content-free [`SuppressReason`] (drives telemetry and the sticky-vs-per-turn scope).
     fn classify_suppress_reason(error_msg: &str) -> SuppressReason {
         let m = error_msg.to_ascii_lowercase();
         if m.contains("spending-limit")
@@ -718,15 +717,98 @@ impl SessionActor {
             SuppressReason::Other
         }
     }
-    /// Choose the post-compaction history for a forked session: re-pin the inherited
-    /// prefix, or release it (fall back to the self-contained summary the summarizer
-    /// already built from the whole conversation) when re-pinning would leave the fork
-    /// at/over the auto-compact threshold. On release, sets the sticky flag and records
-    /// the release span field (this runs within the `run_compact_inner` span).
+    /// Strip the known internal prefixes (wrappers nest), then apply the shared normalize sequence ([`normalize_compact_detail`]).
+    fn user_facing_compact_error(raw: &str) -> String {
+        use crate::session::helpers::session_compact::normalize_compact_detail;
+        const INTERNAL_PREFIXES: &[&str] = &[
+            COMPACT_FAILED_PREFIX,
+            COMPACTION_FAILED_GUARD_PREFIX,
+            xai_grok_compaction::sampler::SAMPLER_BUILD_FAILED_PREFIX,
+            xai_grok_compaction::sampler::SAMPLER_START_FAILED_PREFIX,
+        ];
+        let mut rest = raw.trim();
+        loop {
+            let Some(prefix) = INTERNAL_PREFIXES.iter().find(|p| {
+                rest.as_bytes()
+                    .get(..p.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(p.as_bytes()))
+            }) else {
+                break;
+            };
+            rest = rest[prefix.len()..].trim_start();
+        }
+        normalize_compact_detail(rest)
+    }
+    /// True for an auth/401 compact failure; callers abort the turn for a reauth resubmit instead of sampling oversized.
+    pub(crate) fn is_auth_compact_error(err: &acp::Error) -> bool {
+        matches!(
+            Self::classify_suppress_reason(&crate::sampling::error::acp_error_message(err)),
+            SuppressReason::Auth
+        )
+    }
+    /// Terminal auth compact failure: emit RetryState auth (reauth stash) and auth_required.
+    /// Separate from `AutoCompactFailed` (user-facing); this aborts the turn.
+    pub(crate) async fn surface_compact_auth_failure(&self, err: acp::Error) -> acp::Error {
+        use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
+        use crate::extensions::notification::UNAUTHORIZED_NEEDLE;
+        let detailed = crate::sampling::error::acp_error_message(&err);
+        let message = if detailed.to_ascii_lowercase().contains("unauthorized") {
+            detailed
+        } else {
+            format!(
+                "{UNAUTHORIZED_NEEDLE}: compaction failed — re-authenticate with /login \
+                 and retry. ({detailed})"
+            )
+        };
+        tracing::warn!(
+            session_id = %self.session_info.id.0,
+            error = %message,
+            "auto-compact auth failure: aborting turn for re-auth"
+        );
+        xai_grok_telemetry::unified_log::warn(
+            "auto-compact auth failure: aborting turn for re-auth",
+            Some(self.session_info.id.0.as_ref()),
+            Some(serde_json::json!({
+                "message": crate::util::truncate(&message, 300),
+            })),
+        );
+        self.send_xai_notification(XaiSessionUpdate::RetryState(
+            crate::extensions::notification::RetryState::Failed {
+                error_type: "auth".to_string(),
+                message: message.clone(),
+            },
+        ))
+        .await;
+        acp::Error::auth_required().data(crate::sampling::error::terminal_error_data(
+            message,
+            Some(401),
+            xai_grok_sampler::SamplingErrorKind::Auth,
+        ))
+    }
+    /// Clear [`SUPPRESS_AUTH`] on login/token refresh (credit suppress waits for a 200).
+    pub(crate) fn clear_auth_compact_suppression(&self) {
+        let _ = self.compaction.auto_compact_suppressed.compare_exchange(
+            SUPPRESS_AUTH,
+            SUPPRESS_NONE,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    /// Credit or auth suppress; a model switch cannot clear these.
+    fn is_account_state_suppressed(&self) -> bool {
+        matches!(
+            self.compaction
+                .auto_compact_suppressed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            SUPPRESS_UNTIL_SUCCESS | SUPPRESS_AUTH
+        )
+    }
+    /// Choose the post-compaction history for a forked session.
+    /// Re-pin the inherited prefix, or release it when re-pinning would leave the fork at/over the auto-compact threshold.
+    /// A release falls back to the self-contained summary the summarizer already built from the whole conversation.
+    /// A release also sets the sticky flag and records the release span field (this runs within the `run_compact_inner` span).
     ///
-    /// This runtime release compensates for a verbatim mirror-fork that pinned its whole
-    /// parent transcript; bounding the inherited prefix at fork admission is the
-    /// structural alternative that would remove this path.
+    /// This runtime release compensates for a verbatim mirror-fork that pinned its whole parent transcript.
     async fn resolve_forked_compacted_history(
         &self,
         compacted_history: Vec<ConversationItem>,
@@ -754,14 +836,17 @@ impl SessionActor {
                         .store(true, std::sync::atomic::Ordering::Relaxed);
                     tracing::Span::current().record("compaction_prefix_released", true);
                     tracing::info!(
-                        session_id = % self.session_info.id.0, prefix_len,
+                        session_id = %self.session_info.id.0,
+                        prefix_len,
                         projected_preserved,
                         "compaction: releasing inherited prefix under pressure"
                     );
                     release_candidate
                 } else {
                     tracing::info!(
-                        session_id = % self.session_info.id.0, prefix_len, compacted_len,
+                        session_id = %self.session_info.id.0,
+                        prefix_len,
+                        compacted_len,
                         "Preserving inherited prefix across compaction"
                     );
                     preserved
@@ -769,16 +854,16 @@ impl SessionActor {
             }
             Err(original) => {
                 tracing::warn!(
-                    session_id = % self.session_info.id.0, prefix_len, conversation_len =
-                    full_conv.len(),
+                    session_id = %self.session_info.id.0,
+                    prefix_len,
+                    conversation_len = full_conv.len(),
                     "Inherited prefix invalid, using compacted history as-is"
                 );
                 original
             }
         }
     }
-    /// Inner implementation of compaction that supports an optional `auto_continue`
-    /// payload for the checkpoint.
+    /// Inner implementation of compaction that supports an optional `auto_continue` payload for the checkpoint.
     #[tracing::instrument(
         name = "session.compact_inner",
         skip_all,
@@ -814,7 +899,9 @@ impl SessionActor {
         user_context: Option<String>,
         auto_continue: Option<crate::extensions::notification::AutoContinueInfo>,
         trigger: xai_grok_telemetry::events::CompactionTrigger,
+        lossy_input: bool,
     ) -> Result<(), acp::Error> {
+        let (cancel, _cancel_scope) = self.compaction.cancel.enter();
         let tokens_before = self.chat_state_handle.get_total_tokens().await;
         tracing::Span::current().record("compaction_tokens_before", tokens_before as i64);
         self.signals_handle().record_compaction(tokens_before);
@@ -847,11 +934,26 @@ impl SessionActor {
             .unwrap_or(false);
         let model_id = sampling_config.map(|c| c.model).unwrap_or_default();
         let compaction = xai_grok_telemetry::events::CompactionScope::begin(
-            trigger,
-            tokens_before,
-            context_window,
-            model_id.clone(),
-            user_context.is_some(),
+            xai_grok_telemetry::events::CompactionBeginParams {
+                trigger,
+                tokens_used: tokens_before,
+                context_window,
+                model_id: model_id.clone(),
+                user_context_provided: user_context.is_some(),
+                compaction_mode: match self.compaction.compaction_mode {
+                    xai_chat_state::CompactionMode::Summary => {
+                        xai_grok_telemetry::events::CompactionModeLabel::Summary
+                    }
+                    xai_chat_state::CompactionMode::Transcript => {
+                        xai_grok_telemetry::events::CompactionModeLabel::Transcript
+                    }
+                    xai_chat_state::CompactionMode::Segments(_) => {
+                        xai_grok_telemetry::events::CompactionModeLabel::Segments
+                    }
+                },
+                two_pass_enabled: self.two_pass_active(),
+                is_subagent: self.startup_hints.is_subagent,
+            },
         );
         let compact_source = trigger_str;
         self.dispatch_hook(
@@ -870,6 +972,7 @@ impl SessionActor {
             self.chat_state_handle.get_system_message(),
             self.chat_state_handle.get_conversation(),
         );
+        let assembly_start = std::time::Instant::now();
         let segment_messages = if self.compaction.compaction_mode.writes_segments() {
             xai_chat_state::compaction_utils::prepare_conversation_for_segment(
                 full_conversation.clone(),
@@ -878,8 +981,8 @@ impl SessionActor {
             Vec::new()
         };
         const SUMMARY_BUDGET_RESERVE_TOKENS: u64 = 32_768;
-        let verbatim_input_enabled = self.compaction.verbatim_input;
-        let simplified_messages = if verbatim_input_enabled {
+        let verbatim_input_enabled = self.compaction.verbatim_input && !lossy_input;
+        let mut simplified_messages = if verbatim_input_enabled {
             xai_chat_state::compaction_utils::prepare_conversation_for_verbatim_summarization(
                 full_conversation,
                 summary_strips_reasoning,
@@ -889,55 +992,61 @@ impl SessionActor {
                 full_conversation,
             )
         };
+        let pre_compaction_ms = assembly_start.elapsed().as_millis() as u64;
         if conv_len == 0 {
             tracing::error!(
-                session_id = % self.session_info.id.0,
+                session_id = %self.session_info.id.0,
                 "Compaction failed: conversation is empty (ChatStateActor may have died)"
             );
-            return Err(
-                acp::Error::internal_error().data("Compaction failed: conversation is empty")
-            );
+            return Err(acp::Error::internal_error().data(format!(
+                "{COMPACTION_FAILED_GUARD_PREFIX}conversation is empty"
+            )));
         }
         let system_message = match system_message {
             Some(msg) => msg,
             None => {
                 tracing::error!(
-                    session_id = % self.session_info.id.0, conversation_len = conv_len,
+                    session_id = %self.session_info.id.0,
+                    conversation_len = conv_len,
                     "Compaction failed: no system message in conversation history"
                 );
-                return Err(acp::Error::internal_error()
-                    .data("Compaction failed: no system message in conversation history"));
+                return Err(acp::Error::internal_error().data(format!(
+                    "{COMPACTION_FAILED_GUARD_PREFIX}no system message in conversation history"
+                )));
             }
         };
         if simplified_messages.is_empty() {
             tracing::error!(
-                session_id = % self.session_info.id.0, conversation_len = conv_len,
+                session_id = %self.session_info.id.0,
+                conversation_len = conv_len,
                 "Compaction failed: simplified conversation is empty"
             );
-            return Err(acp::Error::internal_error()
-                .data("Compaction failed: simplified conversation is empty"));
+            return Err(acp::Error::internal_error().data(format!(
+                "{COMPACTION_FAILED_GUARD_PREFIX}simplified conversation is empty"
+            )));
         }
         if !simplified_messages
             .iter()
             .any(|msg| matches!(msg, ConversationItem::System(_)))
         {
             tracing::error!(
-                session_id = % self.session_info.id.0, conversation_len = conv_len,
+                session_id = %self.session_info.id.0,
+                conversation_len = conv_len,
                 simplified_len = simplified_messages.len(),
                 "Compaction failed: no system message in simplified conversation"
             );
-            return Err(acp::Error::internal_error()
-                .data("Compaction failed: no system message in simplified conversation"));
+            return Err(acp::Error::internal_error().data(format!(
+                "{COMPACTION_FAILED_GUARD_PREFIX}no system message in simplified conversation"
+            )));
         }
         let sampling_config = self.reconstruct_full_config().await;
         let sampling_client = self.prepare_chat_completion(false).await?;
-        let use_backend_search =
-            self.agent.borrow().backend_search_enabled() && self.supports_backend_search.get();
+        let backend_search_active = self.backend_search_active();
         let effective_tool_defs: Vec<xai_grok_sampling_types::ToolDefinition> = self
             .prepare_tool_definitions()
             .await
             .into_iter()
-            .filter(|td| !use_backend_search || td.function.name != "web_search")
+            .filter(|td| !backend_search_active || td.function.name != "web_search")
             .collect();
         let compaction_tool_tokens =
             xai_chat_state::estimate_tool_definitions_tokens(&effective_tool_defs);
@@ -946,11 +1055,13 @@ impl SessionActor {
             .map(xai_grok_sampling_types::ToolSpec::from)
             .collect();
         let compaction_hosted_tools: Vec<xai_grok_sampling_types::HostedTool> =
-            if use_backend_search {
-                self.agent.borrow().hosted_tools().to_vec()
-            } else {
-                Vec::new()
-            };
+            self.hosted_tools_for_turn();
+        if lossy_input {
+            simplified_messages = xai_chat_state::compaction_utils::fit_conversation_to_budget(
+                simplified_messages,
+                lossy_input_budget(context_window, compaction_tool_tokens),
+            );
+        }
         tracing::info!(
             num_tools = compaction_tools.len(),
             tool_tokens = compaction_tool_tokens,
@@ -995,12 +1106,17 @@ impl SessionActor {
             user_context.clone(),
             compaction_tools.clone(),
             compaction_hosted_tools.clone(),
+            compaction_tool_tokens,
             sampling_client,
             self.session_info.id.clone(),
             sampling_config.clone(),
             self.inference_idle_timeout,
             wall_clock_budget_secs,
             self.compaction.tool_choice,
+<<<<<<< HEAD
+=======
+            cancel.clone(),
+>>>>>>> 72a61251fcffb464bcc687aeb5a998e5a98ec0c9
         );
         let observer =
             crate::session::helpers::full_replace_compaction::ShellFullReplaceObserver::new(
@@ -1021,6 +1137,7 @@ impl SessionActor {
         let two_pass_output = self
             .try_two_pass_pass2_apply(user_context.as_deref(), summary_strips_reasoning)
             .await;
+        let two_pass_used = two_pass_output.is_some();
         let mut compact_summary: Option<String> =
             two_pass_output.as_ref().map(|o| o.content.clone());
         while compact_summary.is_none() {
@@ -1039,7 +1156,8 @@ impl SessionActor {
                 }
                 Err(xai_grok_compaction::FullReplaceError::NothingToCompact) => {
                     last_error = Some(
-                        acp::Error::internal_error().data("compact failed: nothing to compact"),
+                        acp::Error::internal_error()
+                            .data(format!("{COMPACT_FAILED_PREFIX}nothing to compact")),
                     );
                     break;
                 }
@@ -1051,7 +1169,7 @@ impl SessionActor {
                     };
                     last_error = Some(acp::Error::internal_error().data(
                         observer.last_error_message().unwrap_or_else(|| {
-                            "compact failed: model returned empty response".to_string()
+                            format!("{COMPACT_FAILED_PREFIX}model returned empty response")
                         }),
                     ));
                     break;
@@ -1061,6 +1179,13 @@ impl SessionActor {
                     deterministic,
                     context_overflow,
                 }) => {
+                    if cancel.is_cancelled()
+                        || message.contains(
+                            crate::session::helpers::session_compact::COMPACT_CANCELLED_MSG,
+                        )
+                    {
+                        return self.emit_compact_cancelled(auto_trigger).await;
+                    }
                     if context_overflow {
                         let next_stage = match input_stage {
                             InputStage::Verbatim => Some(InputStage::VerbatimFitted),
@@ -1082,8 +1207,9 @@ impl SessionActor {
                                 },
                             );
                             tracing::warn!(
-                                session_id = % self.session_info.id.0, ? stage, error = %
-                                message,
+                                session_id = %self.session_info.id.0,
+                                ?stage,
+                                error = %message,
                                 "Compaction input overflowed deterministically; stepping down the input ladder to avoid an incompactable state"
                             );
                             let conv = self.chat_state_handle.get_conversation().await;
@@ -1097,17 +1223,16 @@ impl SessionActor {
                                         summary_strips_reasoning,
                                     );
                                     xai_chat_state::compaction_utils::fit_conversation_to_budget(
-                                        verbatim, budget,
+                                        verbatim,
+                                        budget,
                                     )
                                 }
                                 InputStage::Lossy => {
-                                    let lossy_budget = (context_window.saturating_mul(7) / 10)
-                                        .saturating_sub(compaction_tool_tokens);
                                     xai_chat_state::compaction_utils::fit_conversation_to_budget(
                                         xai_chat_state::compaction_utils::prepare_conversation_for_summarization(
                                             conv,
                                         ),
-                                        lossy_budget,
+                                        lossy_input_budget(context_window, compaction_tool_tokens),
                                     )
                                 }
                                 InputStage::Verbatim => {
@@ -1121,6 +1246,7 @@ impl SessionActor {
                         if auto_trigger {
                             self.suppress_auto_compaction(
                                 SuppressReason::Size,
+                                &message,
                                 estimated_input_tokens,
                                 context_window,
                             )
@@ -1135,6 +1261,7 @@ impl SessionActor {
                             let reason = Self::classify_suppress_reason(&message);
                             self.suppress_auto_compaction(
                                 reason,
+                                &message,
                                 estimated_input_tokens,
                                 context_window,
                             )
@@ -1150,12 +1277,9 @@ impl SessionActor {
             }
         }
         let telemetry = observer.into_telemetry();
-        if two_pass_output.is_none() {
-            let request_chat_history = build_compaction_chat_history(
-                request_turns,
-                user_context.as_deref(),
-                use_short_prompt,
-            );
+        if two_pass_output.is_none()
+            && let Some(request_chat_history) = sampler.take_last_attempted_items()
+        {
             self.persist_compaction_request_artifact(
                 request_chat_history,
                 compaction_tools,
@@ -1222,8 +1346,7 @@ impl SessionActor {
                     .await
                     .into_iter()
                     .collect();
-                let bridge_for_skills = self.agent.borrow().tool_bridge().clone();
-                let skills = bridge_for_skills.slash_skills().await;
+                let skills = self.slash_skills_for_resolve().await;
                 let edited_paths = self.chat_state_handle.get_agent_edited_paths().await;
                 let ctx = {
                     let bridge_tasks = self
@@ -1337,6 +1460,65 @@ impl SessionActor {
                             })
                             .unwrap_or_default()
                     };
+                    let scheduled_loops = {
+                        use crate::session::helpers::compaction_context::ScheduledLoopSummary;
+                        let now = chrono::Utc::now();
+                        let bridge = self.agent.borrow().tool_bridge().clone();
+                        bridge
+                        .list_scheduled_tasks()
+                        .await
+                        .into_iter()
+                        .filter(|t| t.pending_fire_at(now).is_some())
+                        .map(|t| {
+                            let next_fire_at = format_loop_next_fire(
+                                t.next_fire_at(),
+                                now,
+                            );
+                            ScheduledLoopSummary {
+                                task_id: t.id,
+                                interval: xai_grok_tools::implementations::grok_build::scheduler::interval::interval_to_human(
+                                    t.interval_secs,
+                                ),
+                                next_fire_at,
+                                prompt: t.prompt,
+                                recurring: t.recurring,
+                                durable: t.durable,
+                                foreground: t.foreground,
+                            }
+                        })
+                        .collect()
+                    };
+                    let workflows = {
+                        use crate::session::helpers::compaction_context::WorkflowRunSummary;
+                        let tracker = self.workflow_tracker().await;
+                        let guard = tracker.lock();
+                        guard
+                            .list()
+                            .into_iter()
+                            .filter(|r| !r.status.is_terminal())
+                            .map(|r| WorkflowRunSummary {
+                                elapsed_ms: guard.elapsed_ms(&r.run_id),
+                                name: r.name,
+                                run_id: r.run_id,
+                                status: r.status.as_str().to_string(),
+                                objective: r.objective,
+                                current_phase: r.current_phase,
+                                agents_used: r.agents_used,
+                                agent_budget: r.agent_budget,
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    let workflow_tool_name = if workflows.is_empty() {
+                        None
+                    } else {
+                        use xai_grok_tools::types::tool::ToolKind;
+                        self.agent
+                            .borrow()
+                            .tool_bridge()
+                            .tool_for_kind(ToolKind::Workflow)
+                            .await
+                            .filter(|s| !s.is_empty())
+                    };
                     CompactionStateContext::build(
                         &conversation,
                         CompactionInputs {
@@ -1345,6 +1527,10 @@ impl SessionActor {
                             agent_edited_paths: edited_paths.clone(),
                             connected_mcp_servers,
                             todos,
+                            scheduled_loops,
+                            workflows,
+                            workflow_tool_name,
+                            ..Default::default()
                         },
                     )
                     .await
@@ -1371,10 +1557,11 @@ impl SessionActor {
                     (Some(poll), Some(cancel)) => Some(SubagentToolNames { poll, cancel }),
                     (poll, cancel) => {
                         tracing::warn!(
-                            session_id = % self.session_info.id.0, poll_resolved = poll
-                            .is_some(), cancel_resolved = cancel.is_some(),
+                            session_id = %self.session_info.id.0,
+                            poll_resolved = poll.is_some(),
+                            cancel_resolved = cancel.is_some(),
                             "could not resolve subagent tool names, \
-                                 omitting subagent reminder from compacted conversation"
+                             omitting subagent reminder from compacted conversation"
                         );
                         None
                     }
@@ -1409,7 +1596,8 @@ impl SessionActor {
                     crate::session::memory::MemoryBackendImpl::from_session_params(
                         storage.clone(),
                         &crate::session::memory::MemoryBackendParams {
-                            search_source: "compaction_recovery",
+                            search_source:
+                                crate::session::memory::MemorySearchSource::CompactionRecovery,
                             ..params.clone()
                         },
                     )
@@ -1425,8 +1613,12 @@ impl SessionActor {
                     .map(|b| b as &dyn xai_grok_tools::types::memory_backend::MemoryBackend)
             };
         let suppress_state_reminder = false;
+        let workflow_listing = self.workflow_listing_for_prompt();
         let system_reminder = if suppress_state_reminder {
-            None
+            workflow_listing.as_deref().map(|listing| {
+                let tag = self.reminder_wrapper_tag();
+                format!("<{tag}>\n## Available Workflows\n{listing}\n</{tag}>")
+            })
         } else {
             to_system_reminder(
                 &state_context,
@@ -1435,6 +1627,7 @@ impl SessionActor {
                 memory_ref,
                 subagent_tool_names.as_ref(),
                 mcp_tool_names.as_ref(),
+                workflow_listing.as_deref(),
             )
             .await
         };
@@ -1470,7 +1663,7 @@ impl SessionActor {
                     )),
                     (existing, None) => {
                         tracing::warn!(
-                            session_id = % self.session_info.id.0,
+                            session_id = %self.session_info.id.0,
                             "compaction: plan mode active but template render failed"
                         );
                         existing
@@ -1479,6 +1672,18 @@ impl SessionActor {
             } else {
                 system_reminder
             }
+        };
+        let system_reminder = if let Some(goal_section) = self.compaction_goal_section().await {
+            use crate::session::acp_session::splice_goal_section;
+            match system_reminder {
+                Some(existing) => Some(splice_goal_section(&existing, &goal_section)),
+                None => {
+                    let tag = self.reminder_wrapper_tag();
+                    Some(format!("<{tag}>\n{goal_section}\n</{tag}>"))
+                }
+            }
+        } else {
+            system_reminder
         };
         if let Some(ref recovery_backend) = memory_backend_impl {
             let n = recovery_backend
@@ -1489,20 +1694,22 @@ impl SessionActor {
                     .compaction_recovery_count
                     .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
                 tracing::debug!(
-                    target : xai_grok_telemetry::memory_log::TARGET, count = n,
-                    "MEMORY_COMPACTION_RECOVERY: {} search(es) performed", n,
+                    target: xai_grok_telemetry::memory_log::TARGET,
+                    count = n,
+                    "MEMORY_COMPACTION_RECOVERY: {} search(es) performed",
+                    n,
                 );
             }
         }
         let agents_md_reminder = self.agent.borrow().agents_md_user_reminder();
         let compaction_context = state_context.for_compaction();
         let compaction_state_context: &CompactionStateContext = &compaction_context;
-        self.persist_compaction_segment(&segment_messages, &generate_session_compact);
         let transcript_hint = self.transcript_hint();
         let summary_count = self
             .compaction
             .count
             .load(std::sync::atomic::Ordering::Relaxed);
+        let apply_start = std::time::Instant::now();
         let raw_compacted = build_compacted_history(CompactedHistoryInput {
             system_message: system_message.clone(),
             user_message_prefix: user_message_prefix.clone(),
@@ -1519,9 +1726,9 @@ impl SessionActor {
             sanitize_result.items
         } else {
             tracing::warn!(
-                session_id = % self.session_info.id, stripped_count = sanitize_result
-                .stripped_tool_call_ids.len(), stripped_ids = ? sanitize_result
-                .stripped_tool_call_ids,
+                session_id = %self.session_info.id,
+                stripped_count = sanitize_result.stripped_tool_call_ids.len(),
+                stripped_ids = ?sanitize_result.stripped_tool_call_ids,
                 "compaction: stripped orphaned ToolResults from compacted history"
             );
             sanitize_result.items
@@ -1531,8 +1738,9 @@ impl SessionActor {
             compacted_history
         } else {
             tracing::error!(
-                session_id = % self.session_info.id, violation_count =
-                remaining_violations.len(), violation_ids = ? remaining_violations,
+                session_id = %self.session_info.id,
+                violation_count = remaining_violations.len(),
+                violation_ids = ?remaining_violations,
                 "compaction: sanitized history still has invalid ToolResults -- \
                  falling back to minimal compacted history (no recent_messages)"
             );
@@ -1541,16 +1749,15 @@ impl SessionActor {
                 user_message_prefix,
                 agents_md_reminder,
                 state_context: &state_context.for_compaction(),
-                compaction_summary: generate_session_compact,
+                compaction_summary: generate_session_compact.clone(),
                 system_reminder,
                 summary_before_recent: use_short_prompt,
                 transcript_hint,
                 summary_count,
             })
         };
+        let post_compaction_ms = apply_start.elapsed().as_millis() as u64;
         let prompt_index_at_compaction = self.chat_state_handle.get_prompt_index().await;
-        self.chat_state_handle
-            .record_compaction_at(prompt_index_at_compaction);
         let original_user_info = self
             .chat_state_handle
             .get_conversation_item_at(1)
@@ -1566,6 +1773,14 @@ impl SessionActor {
                 }
                 _ => None,
             });
+        if cancel.is_cancelled() {
+            return self.emit_compact_cancelled(auto_trigger).await;
+        }
+        let segments_queued = u32::from(
+            self.persist_compaction_segment(&segment_messages, &generate_session_compact),
+        );
+        self.chat_state_handle
+            .record_compaction_at(prompt_index_at_compaction);
         self.persist_compaction_checkpoint(
             &compacted_history,
             prompt_index_at_compaction,
@@ -1606,7 +1821,8 @@ impl SessionActor {
                     .auto_compact_suppressed
                     .store(SUPPRESS_STICKY, std::sync::atomic::Ordering::Relaxed);
                 tracing::warn!(
-                    session_id = % self.session_info.id.0, post_replace_tokens,
+                    session_id = %self.session_info.id.0,
+                    post_replace_tokens,
                     context_window,
                     "compaction: released history still over threshold; suppressing AUTO to avoid a re-loop"
                 );
@@ -1626,10 +1842,7 @@ impl SessionActor {
             .context_injected
             .store(false, std::sync::atomic::Ordering::Relaxed);
         if self.memory.is_enabled() {
-            tracing::info!(
-                target : xai_grok_telemetry::memory_log::TARGET,
-                "MEMORY_COMPACT: post-compaction reset, next turn re-checks injection (search only if no block persisted)"
-            );
+            tracing::info!(target: xai_grok_telemetry::memory_log::TARGET, "MEMORY_COMPACT: post-compaction reset, next turn re-checks injection (search only if no block persisted)");
         }
         let _ = self
             .notifications
@@ -1647,7 +1860,7 @@ impl SessionActor {
             .tool_bridge()
             .on_skill_discovery_compaction()
             .await;
-        self.persist_announcement_state().await;
+        self.rearm_failed_server_announcements().await;
         self.plan_mode.lock().reset_after_compaction();
         self.persist_plan_mode_state();
         self.dispatch_hook(
@@ -1703,11 +1916,22 @@ impl SessionActor {
                 span.record("compaction_itl_max_ms", ms as i64);
             }
         }
-        compaction.complete(tokens_after);
+        compaction.complete(
+            xai_grok_telemetry::events::CompactionCompleteStats {
+                tokens_after,
+                two_pass_used,
+                segments_queued,
+                degenerate_retries: telemetry.degenerate_rejections,
+                input_overflow_retries: input_overflow_rejections,
+            },
+            xai_grok_telemetry::events::CompactionTiming {
+                model_wait_ms: compact_output.model_wait_ms(),
+                pre_compaction_ms: Some(pre_compaction_ms),
+                post_compaction_ms: Some(post_compaction_ms),
+            },
+        );
         Ok(())
     }
-    /// Check if auto-compact should be triggered based on context window usage.
-    /// Returns Some(AutoCompactTriggerInfo) if threshold is reached, None otherwise.
     pub(crate) fn should_auto_compact(
         &self,
         total_tokens: u64,
@@ -1729,25 +1953,26 @@ impl SessionActor {
             None
         }
     }
-    /// Returns true if the error response indicates tokens exceed the
-    /// model's context window. Inspects only the model-metadata
-    /// portion of the [`SamplingErrorInfo`] (the `context_window`
-    /// field) against the session's tracked token estimate.
+    /// Returns true if the error response indicates tokens exceed the model's context window.
+    /// Inspects only the model-metadata portion of the [`SamplingErrorInfo`] (the `context_window` field) against the tracked token estimate.
     ///
-    /// Called from `handle_sampling_failure` with the
-    /// `SamplingErrorInfo` the sampler hands back.
+    /// Called from `handle_sampling_failure` with the `SamplingErrorInfo` the sampler hands back.
     pub(crate) async fn should_compact_on_error(
         &self,
         err: &xai_grok_sampler::SamplingErrorInfo,
     ) -> bool {
-        if self
-            .compaction
-            .auto_compact_suppressed
-            .load(std::sync::atomic::Ordering::Relaxed)
-            != SUPPRESS_NONE
-        {
+        if self.compaction.is_suppressed() {
             return false;
         }
+        self.estimate_exceeds_error_context_window(err).await
+    }
+    /// The request's token estimate exceeds the failed response's reported context window.
+    /// This probable-overflow signal is shared by compact-and-resubmit and the mid-salvage truncated-complete arm.
+    /// The latter must see overflows even while compaction is suppressed.
+    pub(crate) async fn estimate_exceeds_error_context_window(
+        &self,
+        err: &xai_grok_sampler::SamplingErrorInfo,
+    ) -> bool {
         let Some(ref metadata) = err.model_metadata else {
             return false;
         };
@@ -1760,9 +1985,9 @@ impl SessionActor {
         let estimated_total = self.chat_state_handle.get_estimated_total_tokens().await;
         estimated_total > context_window
     }
-    /// Pre-sampling compaction check. Uses `get_estimated_total_tokens()`
-    /// (exact prior count + byte-estimate of items since last response) so
-    /// tool results are accounted for. Returns `None` when `is_flushing`.
+    /// Pre-sampling compaction check.
+    /// Uses `get_estimated_total_tokens()` (exact prior count plus a byte-estimate of items since last response) so tool results are accounted for.
+    /// Returns `None` when `is_flushing`.
     pub(crate) async fn check_auto_compact_needed(&self) -> Option<AutoCompactTriggerInfo> {
         if self
             .memory
@@ -1781,12 +2006,7 @@ impl SessionActor {
         let estimated_total = self.chat_state_handle.get_estimated_total_tokens().await;
         self.signals_handle()
             .update_context_usage(estimated_total, cw);
-        if self
-            .compaction
-            .auto_compact_suppressed
-            .load(std::sync::atomic::Ordering::Relaxed)
-            != SUPPRESS_NONE
-        {
+        if self.compaction.is_suppressed() {
             return None;
         }
         if self
@@ -1823,15 +2043,9 @@ impl SessionActor {
         }
         None
     }
-    /// Returns `Some` when tool call outputs have pushed the estimated token
-    /// count past the context window, indicating pre-emptive compaction is needed.
+    /// Returns `Some` when tool call outputs have pushed the estimated token count past the context window, so pre-emptive compaction is needed.
     pub(crate) async fn check_preflight_overflow(&self) -> Option<AutoCompactTriggerInfo> {
-        if self
-            .compaction
-            .auto_compact_suppressed
-            .load(std::sync::atomic::Ordering::Relaxed)
-            != SUPPRESS_NONE
-        {
+        if self.compaction.is_suppressed() {
             return None;
         }
         let estimated_total = self.chat_state_handle.get_estimated_total_tokens().await;
@@ -1843,7 +2057,10 @@ impl SessionActor {
         let overflow = estimated_total.saturating_sub(cw);
         let percentage = xai_token_estimation::usage_percentage_u8(estimated_total, cw);
         tracing::warn!(
-            estimated_total, context_window = cw, overflow, model = % cfg.model,
+            estimated_total,
+            context_window = cw,
+            overflow,
+            model = %cfg.model,
             "CONTEXT_OVERFLOW_PREFLIGHT: estimated tokens exceed context window \
              after tool call outputs"
         );
@@ -1853,38 +2070,32 @@ impl SessionActor {
             percentage,
         })
     }
-    /// On a model change, clear stale suppression the switch can resolve (sticky
-    /// size/schema — the new window may fit — and a stale per-turn `other`), then
-    /// compact now if the new window is smaller. Account-state suppression
-    /// (credit/auth → `SUPPRESS_UNTIL_SUCCESS`) is left intact — a switch can't
-    /// restore credits or fix auth — and short-circuits the compaction.
-    pub(crate) async fn maybe_compact_on_model_switch(self: &Arc<Self>) {
+    /// On model change: clear sticky/other suppress and compact if the window shrank.
+    /// Leaves credit/auth suppress (a switch can't fix those) and short-circuits.
+    /// Auth compact failures abort the turn (same as pre-sampling/preflight).
+    pub(crate) async fn maybe_compact_on_model_switch(self: &Arc<Self>) -> Result<(), acp::Error> {
+        self.refresh_token_if_expired().await;
         let Some(prev) = self.compaction.previous_model.take() else {
-            return;
+            return Ok(());
         };
         let Some(cfg) = self.chat_state_handle.get_sampling_config().await else {
-            return;
+            return Ok(());
         };
         if cfg.model == prev.model_slug {
-            return;
+            return Ok(());
         }
-        if self
-            .compaction
-            .auto_compact_suppressed
-            .load(std::sync::atomic::Ordering::Relaxed)
-            == SUPPRESS_UNTIL_SUCCESS
-        {
-            return;
+        if self.is_account_state_suppressed() {
+            return Ok(());
         }
         self.compaction
             .auto_compact_suppressed
             .store(SUPPRESS_NONE, std::sync::atomic::Ordering::Relaxed);
         if prev.context_window <= cfg.context_window.get() {
-            return;
+            return Ok(());
         }
         let total_tokens = self.chat_state_handle.get_estimated_total_tokens().await;
         let Some(trigger_info) = self.should_auto_compact(total_tokens, cfg.context_window) else {
-            return;
+            return Ok(());
         };
         tracing::info!(
             "Proactive model-switch compact: {} ({}) -> {} ({}), {}% full",
@@ -1894,9 +2105,13 @@ impl SessionActor {
             cfg.context_window.get(),
             trigger_info.percentage,
         );
-        if let Err(e) = self.run_compact_only(trigger_info).await {
-            tracing::error!(error = % e, "Model-switch compaction failed");
+        if let Err(e) = self.run_compact_only(trigger_info, false).await {
+            tracing::error!(error = %e, "Model-switch compaction failed");
+            if Self::is_auth_compact_error(&e) {
+                return Err(self.surface_compact_auth_failure(e).await);
+            }
         }
+        Ok(())
     }
     /// Record the current model for model-switch detection on the next turn.
     pub(crate) async fn record_turn_model(&self) {
@@ -1928,8 +2143,10 @@ impl SessionActor {
     pub(crate) async fn run_compact_only(
         self: &Arc<Self>,
         trigger_info: AutoCompactTriggerInfo,
+        lossy_input: bool,
     ) -> Result<(), acp::Error> {
         use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
+        let (_cancel, _cancel_scope) = self.compaction.cancel.enter();
         self.record_compaction_variant();
         let tokens_before = self.chat_state_handle.get_total_tokens().await;
         tracing::Span::current().record("pre_tokens", tokens_before as i64);
@@ -1958,6 +2175,7 @@ impl SessionActor {
                 None,
                 None,
                 xai_grok_telemetry::events::CompactionTrigger::Auto,
+                lossy_input,
             )
             .await;
         let elapsed_ms = compact_start.elapsed().as_millis() as i64;
@@ -1974,20 +2192,26 @@ impl SessionActor {
                     summary_preview: None,
                 })
                 .await;
+                self.emit_status_snapshot_detached();
                 Ok(())
             }
             Err(e) => {
                 let span = tracing::Span::current();
                 span.record("success", false);
                 span.record("error", e.to_string().as_str());
-                if self
-                    .compaction
-                    .auto_compact_suppressed
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    == SUPPRESS_NONE
-                {
+                let cancelled = self.compaction.cancel.is_cancelled()
+                    || matches!(
+                        crate::session::helpers::session_compact::compact_error_kind(&e),
+                        Some(crate::session::helpers::session_compact::CompactErrorKind::Cancelled)
+                    )
+                    || e.data.as_ref().and_then(|d| d.as_str()).is_some_and(|s| {
+                        s.contains(crate::session::helpers::session_compact::COMPACT_CANCELLED_MSG)
+                    });
+                if !cancelled && !self.compaction.is_suppressed() {
                     self.send_xai_notification(XaiSessionUpdate::AutoCompactFailed {
-                        error: String::new(),
+                        error: Self::failure_with_retry_guidance(
+                            &crate::sampling::error::acp_error_message(&e),
+                        ),
                     })
                     .await;
                 }
@@ -1997,19 +2221,14 @@ impl SessionActor {
     }
     /// Persist a compaction request artifact for offline prompt iteration.
     ///
-    /// Writes `{session_dir}/compaction_requests/{request_id}.json` containing
-    /// the exact ConversationItem list sent to the compaction model plus the
-    /// summary (or final error) it produced. The file rides on
-    /// the post-turn session archive to cloud storage via the existing per-turn upload
-    /// pipeline — no separate upload path is needed.
+    /// Writes `{session_dir}/compaction_requests/{request_id}.json`.
+    /// The file holds the exact ConversationItem list sent to the compaction model plus the summary (or final error) it produced.
+    /// The file rides on the post-turn session archive to cloud storage via the existing per-turn upload pipeline.
     ///
-    /// `created_at` is taken from the caller-supplied `started_at` (captured
-    /// before the retry loop) rather than `Utc::now()` here, so transient
-    /// retries don't skew the timestamp away from when the call actually
-    /// started.
+    /// `created_at` is taken from the caller-supplied `started_at` (captured before the retry loop) rather than `Utc::now()` here.
+    /// Transient retries then don't skew the timestamp away from when the call actually started.
     ///
-    /// Best-effort: send-failures are logged at `warn` and never surfaced to
-    /// the user, because the artifact is purely for offline analysis.
+    /// Best-effort: send-failures are logged at `warn` and never shown to the user, because the artifact is purely for offline analysis.
     #[allow(clippy::too_many_arguments)]
     fn persist_compaction_request_artifact(
         &self,
@@ -2065,16 +2284,15 @@ impl SessionActor {
             .is_err()
         {
             tracing::warn!(
-                session_id = % self.session_info.id.0,
+                session_id = %self.session_info.id.0,
                 "Failed to send compaction request artifact to persistence channel"
             );
         }
     }
-    /// Persist a compaction checkpoint: writes the compacted history to a separate file
-    /// and records a `CompactionCheckpoint` marker in `updates.jsonl`.
+    /// Persist a compaction checkpoint.
+    /// Writes the compacted history to a separate file and records a `CompactionCheckpoint` marker in `updates.jsonl`.
     ///
-    /// `auto_continue` should be `Some` when this compaction was triggered by auto-compact
-    /// and an auto-continue prompt will follow.
+    /// `auto_continue` should be `Some` when this compaction was triggered by auto-compact and an auto-continue prompt will follow.
     fn persist_compaction_checkpoint(
         &self,
         compacted_history: &[ConversationItem],
@@ -2121,6 +2339,7 @@ impl SessionActor {
     }
 }
 #[cfg(test)]
+<<<<<<< HEAD
 mod inline_auto_compact_flow_tests {
     use super::super::support::*;
     use super::super::*;
@@ -3322,3 +3541,7 @@ mod inline_auto_compact_flow_tests {
             .await;
     }
 }
+=======
+#[path = "compaction_inline_auto_compact_flow_tests.rs"]
+mod inline_auto_compact_flow_tests;
+>>>>>>> 72a61251fcffb464bcc687aeb5a998e5a98ec0c9
