@@ -1,9 +1,8 @@
-//! Persona detail/edit modal — structured view of a persona with inline editing.
+//! Persona detail/edit modal: structured view of a persona with inline editing.
 //!
 //! Opened by pressing Enter on a persona in the `/config-agents` Personas tab.
-//! Renders all persona TOML fields in labeled sections. Editable personas
-//! (user/project scope) support inline field editing; bundled personas are
-//! read-only.
+//! Renders all persona TOML fields in labeled sections.
+//! Editable personas (user/project scope) support inline field editing; bundled personas are read-only.
 
 use std::path::{Path, PathBuf};
 
@@ -97,7 +96,7 @@ enum PersonaDetailMode {
 
 #[derive(Debug)]
 pub enum PersonaDetailOutcome {
-    /// Normal handled event.
+    /// The event was handled and the modal changed.
     Changed,
     /// Nothing to do.
     Unchanged,
@@ -366,7 +365,11 @@ fn render_detail_editor(
     if width > 0 {
         let cursor_x = x + viewport.cursor_display_column as u16;
         if let Some(cell) = buf.cell_mut((cursor_x, y)) {
+<<<<<<< HEAD
             cell.set_style(Style::default().fg(theme.bg_base).bg(theme.text_primary));
+=======
+            cell.set_style(theme.block_cursor_over(theme.bg_base));
+>>>>>>> 75810042ca2762aa0b0fa17864f3f68823ccbea5
         }
     }
 }
@@ -449,7 +452,6 @@ pub fn render_persona_detail(
         let value_x = content_area.x + label_w;
         let value_w = w.saturating_sub(label_w as usize);
 
-        // Check if we're in editing mode for this field.
         if is_selected
             && let PersonaDetailMode::Editing {
                 field: editing_field,
@@ -505,7 +507,7 @@ pub fn render_persona_detail(
                         y += 1;
                         if y < max_y {
                             let hint = format!(
-                                "  ... ({} more lines \u{2014} e to expand, j/k to scroll)",
+                                "  ... ({} more lines: e to expand, j/k to scroll)",
                                 total - max_collapsed
                             );
                             buf.set_string(
@@ -561,7 +563,7 @@ pub fn render_persona_detail(
             } else {
                 Style::default().fg(theme.gray_dim)
             };
-            buf.set_string(value_x, y, "\u{2014}", empty_style);
+            buf.set_string(value_x, y, "-", empty_style);
         } else if value.width() <= value_w {
             // Fits on one line.
             let val_style = if let Some(bg) = row_bg {

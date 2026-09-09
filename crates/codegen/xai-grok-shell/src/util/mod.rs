@@ -1,18 +1,24 @@
 pub mod config;
-pub mod grok_auth_credentials;
+// Extracted to the `xai-grok-login` crate; re-exported so `crate::util::grok_auth_credentials::*` call sites keep compiling unchanged.
+pub use xai_grok_login::grok_auth_credentials;
 pub mod hooks;
+pub mod limits;
+pub(crate) mod text_sanitize;
+pub(crate) mod user_identity;
 
-// The foundation utilities live in `xai-grok-shell-base` (upstream of this
-// crate so they build in parallel). Re-exported at the original paths so
-// existing `crate::util::…` / `xai_grok_shell::util::…` users compile
-// unchanged.
+// The foundation utilities live in `xai-grok-shell-base` (upstream of this crate so they build in parallel)
+// Re-exported at the original paths so existing `crate::util::…` and `xai_grok_shell::util::…` users compile unchanged
 pub use xai_grok_shell_base::util::*;
 
 pub(crate) fn is_user_instruction_path(
     path: &std::path::Path,
     grok_home: &std::path::Path,
     vendor_homes: &[(std::path::PathBuf, bool)],
+<<<<<<< HEAD
     workspace_root: Option<&std::path::Path>,
+=======
+    workspace_roots: &[&std::path::Path],
+>>>>>>> 75810042ca2762aa0b0fa17864f3f68823ccbea5
 ) -> bool {
     let parent = path.parent();
     let grok_rules = grok_home.join("rules");
@@ -26,7 +32,12 @@ pub(crate) fn is_user_instruction_path(
     if is_exact_home_surface {
         return true;
     }
+<<<<<<< HEAD
     if workspace_root.is_some_and(|root| path.starts_with(root)) {
+=======
+    // Both prefixes are workspace because forks mix display-rewritten and on-disk paths.
+    if workspace_roots.iter().any(|root| path.starts_with(root)) {
+>>>>>>> 75810042ca2762aa0b0fa17864f3f68823ccbea5
         return false;
     }
     path.starts_with(grok_home)
@@ -35,6 +46,7 @@ pub(crate) fn is_user_instruction_path(
             .any(|(vendor_home, _)| path.starts_with(vendor_home))
 }
 
+<<<<<<< HEAD
 /// Aborts the wrapped tokio task when dropped.
 ///
 /// Use to tie a spawned helper task's lifetime to an async scope so that
@@ -43,6 +55,12 @@ pub(crate) fn is_user_instruction_path(
 /// Aborting an already-finished task is a no-op, so this is safe to hold
 /// across normal scope exit too.
 pub struct AbortOnDrop(pub tokio::task::JoinHandle<()>);
+=======
+/// Ties a spawned helper task's lifetime to an async scope by aborting it on drop.
+/// Cancelling the parent future (e.g. a turn abort dropping the tool loop) tears down the helper instead of leaving it running detached.
+/// Aborting an already-finished task is a no-op, so this is safe to hold across normal scope exit too.
+pub(crate) struct AbortOnDrop(pub tokio::task::JoinHandle<()>);
+>>>>>>> 75810042ca2762aa0b0fa17864f3f68823ccbea5
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
@@ -61,13 +79,21 @@ mod is_user_instruction_path_tests {
             Path::new("/repo/config/AGENTS.md"),
             Path::new("/repo/config"),
             &[],
+<<<<<<< HEAD
             Some(Path::new("/repo")),
+=======
+            &[Path::new("/repo")],
+>>>>>>> 75810042ca2762aa0b0fa17864f3f68823ccbea5
         ));
         assert!(!is_user_instruction_path(
             Path::new("/repo/config/src/AGENTS.md"),
             Path::new("/repo/config"),
             &[],
+<<<<<<< HEAD
             Some(Path::new("/repo")),
+=======
+            &[Path::new("/repo")],
+>>>>>>> 75810042ca2762aa0b0fa17864f3f68823ccbea5
         ));
     }
 
@@ -77,7 +103,11 @@ mod is_user_instruction_path_tests {
             Path::new("/custom/grok/worktrees/repo/src/AGENTS.md"),
             Path::new("/custom/grok"),
             &[],
+<<<<<<< HEAD
             Some(Path::new("/custom/grok/worktrees/repo")),
+=======
+            &[Path::new("/custom/grok/worktrees/repo")],
+>>>>>>> 75810042ca2762aa0b0fa17864f3f68823ccbea5
         ));
     }
 }
