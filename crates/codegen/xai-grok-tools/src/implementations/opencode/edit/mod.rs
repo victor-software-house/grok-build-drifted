@@ -42,6 +42,7 @@ use crate::types::tool::{ToolKind, ToolNamespace};
 // Description
 // ───────────────────────────────────────────────────────────────────────────
 
+<<<<<<< HEAD
 // NOTE: OpenCode's `EditInput` serializes camelCase (`oldString`, `newString`,
 // `replaceAll`), so param refs must use the camelCase schema property names —
 // the snake_case `params.edit.old_string` keys of the grok_build twin resolve
@@ -51,6 +52,15 @@ const DESCRIPTION: &str = r#"Performs exact string replacements in files.
 Usage:
 - You must use your `${{ tools.by_kind.read }}` tool at least once in the conversation before editing.
 - When editing text from ${{ tools.by_kind.read }} tool output, ensure you preserve the exact indentation (tabs/spaces) as it appears AFTER the line number prefix. The line number prefix format is: line number + →. Everything after that → separator is the actual file content to match. Never include any part of the line number prefix in the ${{ params.edit.oldString }} or ${{ params.edit.newString }}.
+=======
+// NOTE: OpenCode's `EditInput` serializes camelCase (`oldString`, `newString`, `replaceAll`), so param refs must use
+// the camelCase schema property names — the snake_case `params.edit.old_string` keys of the grok_build twin resolve to
+// "" here (the kind-params map is keyed by schema property names).
+const DESCRIPTION: &str = r#"Performs exact string replacements in files.
+
+Usage:${%- if tools.by_kind.read %}
+- When editing text from ${{ tools.by_kind.read }} tool output, ensure you preserve the exact indentation (tabs/spaces) as it appears AFTER the line number prefix. The line number prefix format is: line number + ": ". Everything after that ": " separator is the actual file content to match. Never include any part of the line number prefix in the ${{ params.edit.oldString }} or ${{ params.edit.newString }}.${%- endif %}
+>>>>>>> 37949780c144e37df692e3d669051a21fec24f20
 - ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.
 - The edit will FAIL if `${{ params.edit.oldString }}` is not unique in the file. Either provide a larger string with more surrounding context to make it unique or use `${{ params.edit.replaceAll }}` to change every instance of `${{ params.edit.oldString }}`.
 - Use `${{ params.edit.replaceAll }}` for replacing and renaming strings across the file. This parameter is useful if you want to rename a variable for instance.
@@ -79,38 +89,50 @@ pub struct EditInput {
     )]
     pub new_string: String,
 
-    /// When true, replace every occurrence of `old_string` (default false).
+    /// When true, replace every occurrence of `old_string`.
     #[serde(
         default,
-        deserialize_with = "crate::types::schema::deserialize_lenient_option_bool"
+        deserialize_with = "crate::types::schema::deserialize_lenient_bool"
     )]
+<<<<<<< HEAD
     #[schemars(
         description = "Replace all occurrences of ${{ params.edit.oldString }} (default false)"
     )]
     pub replace_all: Option<bool>,
+=======
+    #[schemars(description = "Replace all occurrences of ${{ params.edit.oldString }}")]
+    pub replace_all: bool,
+>>>>>>> 37949780c144e37df692e3d669051a21fec24f20
 }
-
-// ───────────────────────────────────────────────────────────────────────────
-// ToolInput conversions (via Dynamic variant)
-// ───────────────────────────────────────────────────────────────────────────
 
 impl TryFrom<crate::types::tool_io::ToolInput> for EditInput {
     type Error = String;
     fn try_from(value: crate::types::tool_io::ToolInput) -> Result<Self, Self::Error> {
         match value {
+            crate::types::tool_io::ToolInput::SearchReplace(sr) => Ok(Self {
+                file_path: sr.file_path,
+                old_string: sr.old_string,
+                new_string: sr.new_string,
+                replace_all: sr.replace_all,
+            }),
             crate::types::tool_io::ToolInput::Dynamic(v) => {
                 serde_json::from_value(v).map_err(|e| format!("EditInput: {e}"))
             }
-            _ => Err("expected Dynamic variant for EditInput".into()),
+            _ => Err("expected SearchReplace or Dynamic variant for EditInput".into()),
         }
     }
 }
 
+// Prefer SearchReplace over Dynamic so AccessKind maps to Edit(path).
 impl From<EditInput> for crate::types::tool_io::ToolInput {
     fn from(value: EditInput) -> Self {
-        crate::types::tool_io::ToolInput::Dynamic(
-            serde_json::to_value(value).expect("EditInput serializes to JSON"),
-        )
+        crate::implementations::grok_build::search_replace::SearchReplaceInput {
+            file_path: value.file_path,
+            old_string: value.old_string,
+            new_string: value.new_string,
+            replace_all: value.replace_all,
+        }
+        .into()
     }
 }
 
@@ -158,7 +180,7 @@ impl xai_tool_runtime::Tool for EditTool {
     ) -> xai_tool_types::ToolDescription {
         xai_tool_types::ToolDescription::new(
             "edit",
-            crate::types::tool_metadata::ToolMetadata::description_template(self),
+            crate::types::tool_metadata::ToolMetadata::sanitized_description_template(self),
         )
     }
 
@@ -197,7 +219,7 @@ impl xai_tool_runtime::Tool for EditTool {
         };
         let tool_call_id = ctx.call_id.as_str().to_owned();
 
-        let replace_all = input.replace_all.unwrap_or(false);
+        let replace_all = input.replace_all;
 
         // Resolve the model-provided path.
         let path = resolve_model_path(&cwd, display_cwd.as_deref(), &input.file_path);
@@ -216,7 +238,15 @@ impl xai_tool_runtime::Tool for EditTool {
 
         // ── Route to creation or replacement ────────────────────────
         if input.old_string.is_empty() {
-            handle_new_file_creation(&input, &fs, &notification_handle, &tool_call_id, &path).await
+            handle_new_file_creation(
+                &input,
+                resources,
+                &fs,
+                &notification_handle,
+                &tool_call_id,
+                &path,
+            )
+            .await
         } else {
             handle_replacement(
                 &input,
@@ -254,6 +284,7 @@ async fn ensure_parent_dirs(path: &std::path::Path) -> Result<(), xai_tool_runti
 /// Handle new file creation when `old_string` is empty.
 async fn handle_new_file_creation(
     input: &EditInput,
+    resources: crate::types::resources::SharedResources,
     fs: &Arc<dyn AsyncFileSystem>,
     notification_handle: &crate::notification::types::ToolNotificationHandle,
     tool_call_id: &str,
@@ -271,18 +302,28 @@ async fn handle_new_file_creation(
         ));
     }
 
-    // Create parent directories if needed.
-    ensure_parent_dirs(path).await?;
-
-    // Write the new file.
-    fs.write_file(path, input.new_string.as_bytes())
-        .await
-        .map_err(|e| {
-            xai_tool_runtime::ToolError::execution(
-                xai_tool_protocol::ToolId::new("edit").expect("valid"),
-                e.to_string(),
-            )
-        })?;
+    let is_memory_write = match crate::types::memory_v2::write_memory_v2_file(
+        &resources,
+        path,
+        input.new_string.as_bytes(),
+    )
+    .await
+    {
+        Ok(crate::types::memory_v2::MemoryV2Write::Written { .. }) => true,
+        Ok(crate::types::memory_v2::MemoryV2Write::Outside) => false,
+        Err(error) => return Ok(SearchReplaceOutput::InvalidInput(error)),
+    };
+    if !is_memory_write {
+        ensure_parent_dirs(path).await?;
+        fs.write_file(path, input.new_string.as_bytes())
+            .await
+            .map_err(|e| {
+                xai_tool_runtime::ToolError::execution(
+                    xai_tool_protocol::ToolId::new("edit").expect("valid"),
+                    e.to_string(),
+                )
+            })?;
+    }
 
     // Emit FileWritten notification.
     notification_handle.send_file_written(FileWritten {
@@ -406,14 +447,24 @@ async fn handle_replacement(
     );
 
     // Write the updated file.
-    fs.write_file(path, new_text.as_bytes())
-        .await
-        .map_err(|e| {
-            xai_tool_runtime::ToolError::execution(
-                xai_tool_protocol::ToolId::new("edit").expect("valid"),
-                e.to_string(),
-            )
-        })?;
+    let is_memory_write =
+        match crate::types::memory_v2::write_memory_v2_file(&resources, path, new_text.as_bytes())
+            .await
+        {
+            Ok(crate::types::memory_v2::MemoryV2Write::Written { .. }) => true,
+            Ok(crate::types::memory_v2::MemoryV2Write::Outside) => false,
+            Err(error) => return Ok(SearchReplaceOutput::InvalidInput(error)),
+        };
+    if !is_memory_write {
+        fs.write_file(path, new_text.as_bytes())
+            .await
+            .map_err(|e| {
+                xai_tool_runtime::ToolError::execution(
+                    xai_tool_protocol::ToolId::new("edit").expect("valid"),
+                    e.to_string(),
+                )
+            })?;
+    }
 
     // Emit FileWritten notification.
     notification_handle.send_file_written(FileWritten {
@@ -521,8 +572,43 @@ mod tests {
             file_path: file_path.to_string(),
             old_string: old_string.to_string(),
             new_string: new_string.to_string(),
-            replace_all: None,
+            replace_all: false,
         }
+    }
+
+    #[test]
+    fn tool_input_roundtrip_is_search_replace() {
+        use crate::types::tool_io::ToolInput;
+        let input = make_input("/tmp/denied.txt", "old", "new");
+        let tool_input = ToolInput::from(input.clone());
+        assert!(matches!(
+            tool_input,
+            ToolInput::SearchReplace(ref sr) if sr.file_path == "/tmp/denied.txt"
+        ));
+        let back = EditInput::try_from(tool_input).expect("SearchReplace converts back");
+        assert_eq!(back.file_path, "/tmp/denied.txt");
+        assert_eq!(back.old_string, "old");
+        assert_eq!(back.new_string, "new");
+    }
+
+    #[test]
+    fn replace_all_defaults_false_and_schema_is_boolean() {
+        let missing: EditInput =
+            serde_json::from_str(r#"{"filePath":"/f","oldString":"a","newString":"b"}"#).unwrap();
+        assert!(!missing.replace_all);
+
+        let nullv: EditInput = serde_json::from_str(
+            r#"{"filePath":"/f","oldString":"a","newString":"b","replaceAll":null}"#,
+        )
+        .unwrap();
+        assert!(!nullv.replace_all);
+
+        let schema = serde_json::to_value(schemars::schema_for!(EditInput)).unwrap();
+        // rename_all = camelCase → replaceAll
+        let p = &schema["properties"]["replaceAll"];
+        assert_eq!(p["type"], "boolean", "schema: {schema}");
+        assert_eq!(p["default"], false, "schema: {schema}");
+        assert!(p.get("anyOf").is_none(), "schema: {schema}");
     }
 
     // ── Tool metadata ───────────────────────────────────────────────
@@ -534,16 +620,6 @@ mod tests {
         assert_eq!(xai_tool_runtime::Tool::id(&tool).as_str(), "edit");
         assert_eq!(tool.kind(), ToolKind::Edit);
         assert!(matches!(tool.tool_namespace(), ToolNamespace::OpenCode));
-    }
-
-    #[test]
-    fn description_contains_edit_guidance() {
-        use crate::types::tool_metadata::ToolMetadata;
-        let tool = EditTool;
-        assert!(
-            tool.description_template()
-                .contains("exact string replacements")
-        );
     }
 
     // ── Input deserialization ───────────────────────────────────────
@@ -560,7 +636,7 @@ mod tests {
         assert_eq!(input.file_path, "src/main.rs");
         assert_eq!(input.old_string, "hello");
         assert_eq!(input.new_string, "goodbye");
-        assert_eq!(input.replace_all, Some(true));
+        assert!(input.replace_all);
     }
 
     #[test]
@@ -572,7 +648,7 @@ mod tests {
         });
         let input: EditInput = serde_json::from_value(json).unwrap();
         assert_eq!(input.file_path, "test.txt");
-        assert_eq!(input.replace_all, None);
+        assert!(!input.replace_all);
     }
 
     // ── Validation ──────────────────────────────────────────────────
@@ -816,7 +892,7 @@ mod tests {
             file_path: "test.txt".to_string(),
             old_string: "aaa".to_string(),
             new_string: "ccc".to_string(),
-            replace_all: Some(true),
+            replace_all: true,
         };
         let result = xai_tool_runtime::Tool::run(&tool, test_ctx(resources.into_shared()), input)
             .await
@@ -990,7 +1066,7 @@ mod tests {
             file_path: "test.txt".to_string(),
             old_string: "foo".to_string(),
             new_string: "qux".to_string(),
-            replace_all: Some(true),
+            replace_all: true,
         };
         let result = xai_tool_runtime::Tool::run(&tool, test_ctx(resources.into_shared()), input)
             .await
