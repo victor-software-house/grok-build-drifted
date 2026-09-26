@@ -94,10 +94,15 @@ fn is_non_public_ipv6(ip: Ipv6Addr) -> bool {
         || ip.is_unicast_link_local()
 }
 
+<<<<<<< HEAD
 /// Loopback including IPv4-mapped forms (`::ffff:127.0.0.1`).
 ///
 /// `IpAddr::is_loopback` is false for mapped addresses even when the embedded
 /// v4 is loopback, so local opt-in must use this helper.
+=======
+/// Loopback including IPv4-mapped forms (`::ffff:127.0.0.1`). `IpAddr::is_loopback` is false for
+/// mapped addresses even when the embedded v4 is loopback, so local opt-in must use this helper.
+>>>>>>> f0e3be1100ef5252488e3be8bb0e91cf68d8c305
 fn is_loopback_addr(ip: IpAddr) -> bool {
     if ip.is_loopback() {
         return true;
@@ -108,10 +113,16 @@ fn is_loopback_addr(ip: IpAddr) -> bool {
     }
 }
 
+<<<<<<< HEAD
 /// Whether a resolved address is blocked for this request host.
 ///
 /// Dual-gate: even with local binding allowed, only explicit loopback hosts
 /// may use loopback IPs; private/link-local never open via this flag.
+=======
+/// Whether a resolved address is blocked for this request host. Dual-gate: even with local binding
+/// allowed, only explicit loopback hosts may use loopback IPs; private/link-local never open via
+/// this flag.
+>>>>>>> f0e3be1100ef5252488e3be8bb0e91cf68d8c305
 pub(crate) fn is_blocked_for_host(ip: IpAddr, host: &str, allow_local: bool) -> bool {
     if !is_non_public_ip(ip) {
         return false;
@@ -122,11 +133,17 @@ pub(crate) fn is_blocked_for_host(ip: IpAddr, host: &str, allow_local: bool) -> 
     true
 }
 
+<<<<<<< HEAD
 /// Resolve hostname via DNS and verify none of the resolved addresses are
 /// blocked under the SSRF policy.
 ///
 /// `allow_local` comes from tool config (`WebFetchParams::allow_local`); it is
 /// not read from the environment here so the agent cannot flip the policy.
+=======
+/// Resolve hostname via DNS and verify none of the resolved addresses are blocked under the SSRF
+/// policy. `allow_local` comes from tool config (`WebFetchParams::allow_local`); it is not read
+/// from the environment here so the agent cannot flip the policy.
+>>>>>>> f0e3be1100ef5252488e3be8bb0e91cf68d8c305
 pub(crate) async fn check_ssrf(url: &Url, allow_local: bool) -> Result<(), WebFetchError> {
     let host = url
         .host_str()
