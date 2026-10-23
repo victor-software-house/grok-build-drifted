@@ -14,7 +14,9 @@ concurrency:
 
 jobs:
   sync:
-    runs-on: nscloud-ubuntu-24.04-amd64-4x8
+    # A public repository runs on GitHub's standard runners, which are free
+    # here; one API call needs no more.
+    runs-on: ubuntu-latest
     steps:
       - name: Merge upstream main
         env:
